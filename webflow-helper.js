@@ -1,4 +1,4 @@
-/* Webflow Helper v1.2.0 - 2026-05-06 */
+/* Webflow Helper v1.3.0 - 2026-05-08 */
 
 /**
  * Webflow Helper — minimal surface, exposes 8 cmds via `__webflowHelper.run()`:
@@ -24,7 +24,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -1984,6 +1984,105 @@
 })();
 
 /**
+ * TreeDump — `dumpTree` returns the full Designer Navigator tree as a flat array
+ * with depth + type + tag + id + resolved class names, mirroring what the user
+ * sees in the Navigator panel of Webflow Designer.
+ *
+ * Use case: rapid full-page structure inspection without N MCP query_elements
+ * round-trips (which often timeout or BETA-fail). Resolves styleBlockIds → class
+ * names via StyleBlockStore (cached TTL 1s by core-helpers).
+ *
+ * Performance: Redux walk is synchronous, ~50-100ms on a 200-node page. No WS,
+ * no Bridge round-trip.
+ */
+(function() {
+  'use strict';
+
+  if (!window.__webflowHelper || !window.__webflowHelper._localCmd) {
+    console.log('[TreeDump] __webflowHelper not initialized — skipped');
+    return;
+  }
+
+  var p = window.__webflowHelper;
+  var helpers = p._internal && p._internal.helpers;
+  if (!helpers) {
+    console.log('[TreeDump] core-helpers not loaded — skipped');
+    return;
+  }
+
+  /**
+   * Dump the Navigator tree.
+   * @param {object} [args]
+   * @param {number}  [args.maxDepth=50]      Max depth to walk
+   * @param {string}  [args.filterType]       Filter to a specific type (e.g. 'Section', 'Block', 'HtmlEmbed', 'Heading')
+   * @param {string}  [args.filterClass]      Filter to elements with at least 1 class containing this substring (case-insensitive)
+   * @param {boolean} [args.includeEmpty=true] Include nodes with no class (e.g. raw containers, body)
+   * @param {boolean} [args.compact=false]    Return compact format (depth + type + classes only, no id/tag)
+   * @returns {{ ok: boolean, count: number, total_walked: number, tree: Array, error?: string }}
+   */
+  p._localCmd.dumpTree = function(args) {
+    args = args || {};
+    var maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 50;
+    var filterType = args.filterType || null;
+    var filterClassLower = args.filterClass ? String(args.filterClass).toLowerCase() : null;
+    var includeEmpty = args.includeEmpty !== false;
+    var compact = args.compact === true;
+
+    var root = helpers.getRoot();
+    if (!root) return { ok: false, error: 'No root node — Designer not loaded?' };
+
+    // Resolve styleBlocks once for the entire walk.
+    var sbs = null;
+    try {
+      var state = helpers.getReduxState();
+      var sbStore = state && state.StyleBlockStore;
+      if (sbStore && sbStore.get) {
+        var blocks = sbStore.get('styleBlocks');
+        sbs = blocks && blocks.toJS ? blocks.toJS() : blocks;
+      }
+    } catch (e) { sbs = null; }
+
+    var out = [];
+    var totalWalked = 0;
+
+    helpers.walkTree(root, function(node, depth) {
+      totalWalked++;
+      var type = node.get && node.get('type');
+      var tag = node.get && node.get('tag');
+      var id = node.get && node.get('id');
+
+      // styleBlockIds -> class names
+      var classes = [];
+      try {
+        var data = node.get && node.get('data');
+        var sbIds = data && data.get && data.get('styleBlockIds');
+        var arr = sbIds && sbIds.toJS ? sbIds.toJS() : (Array.isArray(sbIds) ? sbIds : []);
+        classes = arr.map(function(s) { return (sbs && sbs[s] && sbs[s].name) || s; });
+      } catch (e) { classes = []; }
+
+      // Filtering
+      if (filterType && type !== filterType) return;
+      if (filterClassLower) {
+        var match = classes.some(function(c) {
+          return typeof c === 'string' && c.toLowerCase().indexOf(filterClassLower) !== -1;
+        });
+        if (!match) return;
+      }
+      if (!includeEmpty && classes.length === 0 && type !== 'Section' && type !== 'Body') return;
+
+      var entry = compact
+        ? { d: depth, type: type, classes: classes }
+        : { depth: depth, type: type, tag: tag || null, id: id, classes: classes };
+      out.push(entry);
+    }, { maxDepth: maxDepth });
+
+    return { ok: true, count: out.length, total_walked: totalWalked, tree: out };
+  };
+
+  console.log('[TreeDump] 1 command registered: dumpTree');
+})();
+
+/**
  * Launch Bridge — `__webflowHelper.launchBridgeApp` mounts the Webflow MCP
  * Bridge App via direct dispatch of `EXTENSION_OPEN`. Auto-resolves the appId
  * from `AppsStore.installedApps[*]` so no hard-coded hash needed.
@@ -2180,7 +2279,7 @@
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
 // only the 7 whitelisted cmds are callable via `__webflowHelper.run(name)`.
 //
-// Whitelisted cmds (8):
+// Whitelisted cmds (9):
 // 1. switchPage - MCP de_page_tool.switch_page 70% timeout
 // 2. launchBridgeApp - not in MCP
 // 3. appendHtmlEmbedWS - MCP gap (HtmlEmbed creation)
@@ -2189,6 +2288,7 @@
 // 6. getEmbedContent - MCP gap (single embed content read)
 // 7. setEmbedHasScript - MCP gap (w-script flag)
 // 8. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
+// 9. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
 //
 // Bypass: `window.__webflowHelper._localCmd.X(args)` is still callable for
 // debugging or one-off direct access (manual audit trail). The wrapper only
@@ -2209,7 +2309,8 @@
     'listEmbeds',
     'getEmbedContent',
     'setEmbedHasScript',
-    'getCurrentPageInfo'
+    'getCurrentPageInfo',
+    'dumpTree'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
