@@ -1,4 +1,4 @@
-/* Webflow Helper v1.3.0 - 2026-05-08 */
+/* Webflow Helper v1.4.0 - 2026-05-08 */
 
 /**
  * Webflow Helper — minimal surface, exposes 8 cmds via `__webflowHelper.run()`:
@@ -24,7 +24,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '1.3.0';
+  var VERSION = '1.4.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2010,14 +2010,49 @@
     return;
   }
 
+  // Types whose textContent is meaningful (gather from String descendants).
+  var TEXT_BEARING_TYPES = {
+    Heading: true, Paragraph: true, TextLink: true, FormButton: true,
+    Button: true, Span: true, Link: true, NavbarLink: true, DropdownLink: true,
+    NavbarBrand: true, FormBlockLabel: true, Blockquote: true
+  };
+
+  // Extract the plain text content of a text-bearing node by walking its
+  // descendants and concatenating String values + LineBreak as " ".
+  function extractText(node, maxLen) {
+    maxLen = maxLen || 200;
+    var parts = [];
+    function walk(n) {
+      if (!n || !n.get) return;
+      var t = n.get('type');
+      if (t === 'LineBreak') { parts.push(' '); return; }
+      // String nodes have type undefined and data.value
+      if (!t) {
+        var data = n.get('data');
+        var val = data && data.get && data.get('value');
+        if (typeof val === 'string') { parts.push(val); return; }
+      }
+      var children = n.get('children');
+      if (children && children.forEach) children.forEach(walk);
+    }
+    walk(node);
+    var text = parts.join('').replace(/\s+/g, ' ').trim();
+    if (text.length > maxLen) text = text.substring(0, maxLen - 1) + '…';
+    return text;
+  }
+
   /**
    * Dump the Navigator tree.
    * @param {object} [args]
    * @param {number}  [args.maxDepth=50]      Max depth to walk
    * @param {string}  [args.filterType]       Filter to a specific type (e.g. 'Section', 'Block', 'HtmlEmbed', 'Heading')
    * @param {string}  [args.filterClass]      Filter to elements with at least 1 class containing this substring (case-insensitive)
+   * @param {string}  [args.filterText]       Filter to text-bearing elements whose text contains this substring (case-insensitive)
    * @param {boolean} [args.includeEmpty=true] Include nodes with no class (e.g. raw containers, body)
-   * @param {boolean} [args.compact=false]    Return compact format (depth + type + classes only, no id/tag)
+   * @param {boolean} [args.compact=false]    Return compact format (depth + type + classes only, no id/tag/attr/text)
+   * @param {boolean} [args.includeText=true] Include text content for Heading/Paragraph/TextLink/Button (truncated 200 chars)
+   * @param {boolean} [args.includeAttr=true] Include data.attr (HTML id, alt, src, href, width, height, loading) — only non-default values
+   * @param {boolean} [args.includeXattr=true] Include data.xattr (custom attributes data-*, role, aria-*) — only if non-empty
    * @returns {{ ok: boolean, count: number, total_walked: number, tree: Array, error?: string }}
    */
   p._localCmd.dumpTree = function(args) {
@@ -2025,8 +2060,12 @@
     var maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 50;
     var filterType = args.filterType || null;
     var filterClassLower = args.filterClass ? String(args.filterClass).toLowerCase() : null;
+    var filterTextLower = args.filterText ? String(args.filterText).toLowerCase() : null;
     var includeEmpty = args.includeEmpty !== false;
     var compact = args.compact === true;
+    var includeText = args.includeText !== false && !compact;
+    var includeAttr = args.includeAttr !== false && !compact;
+    var includeXattr = args.includeXattr !== false && !compact;
 
     var root = helpers.getRoot();
     if (!root) return { ok: false, error: 'No root node — Designer not loaded?' };
@@ -2048,17 +2087,58 @@
     helpers.walkTree(root, function(node, depth) {
       totalWalked++;
       var type = node.get && node.get('type');
-      var tag = node.get && node.get('tag');
       var id = node.get && node.get('id');
+      var data = node.get && node.get('data');
+
+      // tag (HTML tag) — stored in data.tag, NOT node.get('tag')
+      var tag = (data && data.get) ? (data.get('tag') || null) : null;
 
       // styleBlockIds -> class names
       var classes = [];
       try {
-        var data = node.get && node.get('data');
         var sbIds = data && data.get && data.get('styleBlockIds');
         var arr = sbIds && sbIds.toJS ? sbIds.toJS() : (Array.isArray(sbIds) ? sbIds : []);
         classes = arr.map(function(s) { return (sbs && sbs[s] && sbs[s].name) || s; });
       } catch (e) { classes = []; }
+
+      // attr (HTML attributes) — only non-empty / non-default values
+      var attr = null;
+      if (includeAttr && data && data.get) {
+        try {
+          var rawAttr = data.get('attr');
+          var attrObj = rawAttr && rawAttr.toJS ? rawAttr.toJS() : (rawAttr || {});
+          var cleanAttr = {};
+          var hasAttr = false;
+          Object.keys(attrObj).forEach(function(k) {
+            var v = attrObj[k];
+            // Skip empty strings and common defaults
+            if (v === '' || v === null || v === undefined) return;
+            if (k === 'width' && v === 'auto') return;
+            if (k === 'height' && v === 'auto') return;
+            if (k === 'alt' && v === '__wf_reserved_inherit') { cleanAttr[k] = '<inherit>'; hasAttr = true; return; }
+            cleanAttr[k] = v;
+            hasAttr = true;
+          });
+          if (hasAttr) attr = cleanAttr;
+        } catch (e) { attr = null; }
+      }
+
+      // xattr (custom HTML attributes) — only if non-empty array
+      var xattr = null;
+      if (includeXattr && data && data.get) {
+        try {
+          var rawXattr = data.get('xattr');
+          var xattrArr = rawXattr && rawXattr.toJS ? rawXattr.toJS() : (Array.isArray(rawXattr) ? rawXattr : []);
+          if (xattrArr && xattrArr.length > 0) xattr = xattrArr;
+        } catch (e) { xattr = null; }
+      }
+
+      // textContent for text-bearing types
+      var text = null;
+      if (includeText && type && TEXT_BEARING_TYPES[type]) {
+        try { var t = extractText(node, 200); if (t) text = t; }
+        catch (e) { text = null; }
+      }
 
       // Filtering
       if (filterType && type !== filterType) return;
@@ -2068,11 +2148,20 @@
         });
         if (!match) return;
       }
+      if (filterTextLower) {
+        if (!text || text.toLowerCase().indexOf(filterTextLower) === -1) return;
+      }
       if (!includeEmpty && classes.length === 0 && type !== 'Section' && type !== 'Body') return;
 
-      var entry = compact
-        ? { d: depth, type: type, classes: classes }
-        : { depth: depth, type: type, tag: tag || null, id: id, classes: classes };
+      var entry;
+      if (compact) {
+        entry = { d: depth, type: type, classes: classes };
+      } else {
+        entry = { depth: depth, type: type, tag: tag, id: id, classes: classes };
+        if (attr) entry.attr = attr;
+        if (xattr) entry.xattr = xattr;
+        if (text) entry.text = text;
+      }
       out.push(entry);
     }, { maxDepth: maxDepth });
 
