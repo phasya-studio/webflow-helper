@@ -1,4 +1,4 @@
-/* Webflow Helper v1.4.0 - 2026-05-08 */
+/* Webflow Helper v1.5.0 - 2026-05-08 */
 
 /**
  * Webflow Helper — minimal surface, exposes 8 cmds via `__webflowHelper.run()`:
@@ -24,7 +24,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '1.4.0';
+  var VERSION = '1.5.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2042,6 +2042,93 @@
   }
 
   /**
+   * Build a tree entry from a node + depth + context (sbs, opts).
+   * Pure function — no side effects.
+   */
+  function buildEntry(node, depth, sbs, opts) {
+    var type = node.get && node.get('type');
+    var id = node.get && node.get('id');
+    var data = node.get && node.get('data');
+    var tag = (data && data.get) ? (data.get('tag') || null) : null;
+
+    // classes
+    var classes = [];
+    try {
+      var sbIds = data && data.get && data.get('styleBlockIds');
+      var arr = sbIds && sbIds.toJS ? sbIds.toJS() : (Array.isArray(sbIds) ? sbIds : []);
+      classes = arr.map(function(s) { return (sbs && sbs[s] && sbs[s].name) || s; });
+    } catch (e) { classes = []; }
+
+    // attr
+    var attr = null;
+    if (opts.includeAttr && data && data.get) {
+      try {
+        var rawAttr = data.get('attr');
+        var attrObj = rawAttr && rawAttr.toJS ? rawAttr.toJS() : (rawAttr || {});
+        var cleanAttr = {};
+        var hasAttr = false;
+        Object.keys(attrObj).forEach(function(k) {
+          var v = attrObj[k];
+          if (v === '' || v === null || v === undefined) return;
+          if (k === 'width' && v === 'auto') return;
+          if (k === 'height' && v === 'auto') return;
+          if (k === 'alt' && v === '__wf_reserved_inherit') { cleanAttr[k] = '<inherit>'; hasAttr = true; return; }
+          cleanAttr[k] = v;
+          hasAttr = true;
+        });
+        if (hasAttr) attr = cleanAttr;
+      } catch (e) { attr = null; }
+    }
+
+    // xattr
+    var xattr = null;
+    if (opts.includeXattr && data && data.get) {
+      try {
+        var rawXattr = data.get('xattr');
+        var xattrArr = rawXattr && rawXattr.toJS ? rawXattr.toJS() : (Array.isArray(rawXattr) ? rawXattr : []);
+        if (xattrArr && xattrArr.length > 0) xattr = xattrArr;
+      } catch (e) { xattr = null; }
+    }
+
+    // text
+    var text = null;
+    if (opts.includeText && type && TEXT_BEARING_TYPES[type]) {
+      try { var t = extractText(node, 200); if (t) text = t; }
+      catch (e) { text = null; }
+    }
+
+    // sym info — Symbol instance OR template root
+    var symInfo = null;
+    if (data && data.get) {
+      try {
+        var sym = data.get('sym');
+        if (sym) {
+          var symObj = sym.toJS ? sym.toJS() : sym;
+          if (symObj && (symObj.inst || symObj.root || symObj.name)) symInfo = symObj;
+        }
+      } catch (e) {}
+    }
+
+    var entry;
+    if (opts.compact) {
+      entry = { d: depth, type: type, classes: classes };
+    } else {
+      entry = { depth: depth, type: type, tag: tag, id: id, classes: classes };
+      if (attr) entry.attr = attr;
+      if (xattr) entry.xattr = xattr;
+      if (text) entry.text = text;
+      if (symInfo) {
+        if (symInfo.inst) entry.componentInstance = symInfo.inst;
+        if (symInfo.root === true) {
+          entry.componentRoot = true;
+          if (symInfo.name) entry.componentName = symInfo.name;
+        }
+      }
+    }
+    return { entry: entry, type: type, classes: classes, text: text, symInfo: symInfo };
+  }
+
+  /**
    * Dump the Navigator tree.
    * @param {object} [args]
    * @param {number}  [args.maxDepth=50]      Max depth to walk
@@ -2053,7 +2140,9 @@
    * @param {boolean} [args.includeText=true] Include text content for Heading/Paragraph/TextLink/Button (truncated 200 chars)
    * @param {boolean} [args.includeAttr=true] Include data.attr (HTML id, alt, src, href, width, height, loading) — only non-default values
    * @param {boolean} [args.includeXattr=true] Include data.xattr (custom attributes data-*, role, aria-*) — only if non-empty
-   * @returns {{ ok: boolean, count: number, total_walked: number, tree: Array, error?: string }}
+   * @param {boolean} [args.expandComponents=false] When a Symbol is found, lookup its template via data.sym.inst and walk it inline as virtual children (depth offset). Each expanded node gets `fromTemplate: <inst-id>`. Template roots (data.sym.root=true) at depth 1 of root tree are NOT skipped from main walk by default (cf hideTemplateRoots).
+   * @param {boolean} [args.hideTemplateRoots=false] When expandComponents=true, set this to true to filter out the original template root nodes (depth 1 with sym.root=true) from the main output to avoid duplication. Default false (templates appear both as their root + inline under Symbol instances).
+   * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, error?: string }}
    */
   p._localCmd.dumpTree = function(args) {
     args = args || {};
@@ -2063,9 +2152,14 @@
     var filterTextLower = args.filterText ? String(args.filterText).toLowerCase() : null;
     var includeEmpty = args.includeEmpty !== false;
     var compact = args.compact === true;
-    var includeText = args.includeText !== false && !compact;
-    var includeAttr = args.includeAttr !== false && !compact;
-    var includeXattr = args.includeXattr !== false && !compact;
+    var expandComponents = args.expandComponents === true;
+    var hideTemplateRoots = args.hideTemplateRoots === true;
+    var entryOpts = {
+      compact: compact,
+      includeText: args.includeText !== false && !compact,
+      includeAttr: args.includeAttr !== false && !compact,
+      includeXattr: args.includeXattr !== false && !compact
+    };
 
     var root = helpers.getRoot();
     if (!root) return { ok: false, error: 'No root node — Designer not loaded?' };
@@ -2081,66 +2175,27 @@
       }
     } catch (e) { sbs = null; }
 
+    // Pre-walk: index template roots (data.sym.root === true) by node id.
+    // Templates live at depth 1 of root in Webflow's flat AbstractNodeStore.
+    // Lookup is by data.sym.inst from Symbol instances.
+    var templatesById = {};
+    if (expandComponents) {
+      try {
+        helpers.walkTree(root, function(n) {
+          var d = n.get && n.get('data');
+          var s = d && d.get && d.get('sym');
+          if (s && s.get && s.get('root') === true) {
+            templatesById[n.get('id')] = n;
+          }
+        }, { maxDepth: 5 });
+      } catch (e) { /* fail silently — feature degrades to non-expand */ }
+    }
+
     var out = [];
     var totalWalked = 0;
+    var expandedCount = 0;
 
-    helpers.walkTree(root, function(node, depth) {
-      totalWalked++;
-      var type = node.get && node.get('type');
-      var id = node.get && node.get('id');
-      var data = node.get && node.get('data');
-
-      // tag (HTML tag) — stored in data.tag, NOT node.get('tag')
-      var tag = (data && data.get) ? (data.get('tag') || null) : null;
-
-      // styleBlockIds -> class names
-      var classes = [];
-      try {
-        var sbIds = data && data.get && data.get('styleBlockIds');
-        var arr = sbIds && sbIds.toJS ? sbIds.toJS() : (Array.isArray(sbIds) ? sbIds : []);
-        classes = arr.map(function(s) { return (sbs && sbs[s] && sbs[s].name) || s; });
-      } catch (e) { classes = []; }
-
-      // attr (HTML attributes) — only non-empty / non-default values
-      var attr = null;
-      if (includeAttr && data && data.get) {
-        try {
-          var rawAttr = data.get('attr');
-          var attrObj = rawAttr && rawAttr.toJS ? rawAttr.toJS() : (rawAttr || {});
-          var cleanAttr = {};
-          var hasAttr = false;
-          Object.keys(attrObj).forEach(function(k) {
-            var v = attrObj[k];
-            // Skip empty strings and common defaults
-            if (v === '' || v === null || v === undefined) return;
-            if (k === 'width' && v === 'auto') return;
-            if (k === 'height' && v === 'auto') return;
-            if (k === 'alt' && v === '__wf_reserved_inherit') { cleanAttr[k] = '<inherit>'; hasAttr = true; return; }
-            cleanAttr[k] = v;
-            hasAttr = true;
-          });
-          if (hasAttr) attr = cleanAttr;
-        } catch (e) { attr = null; }
-      }
-
-      // xattr (custom HTML attributes) — only if non-empty array
-      var xattr = null;
-      if (includeXattr && data && data.get) {
-        try {
-          var rawXattr = data.get('xattr');
-          var xattrArr = rawXattr && rawXattr.toJS ? rawXattr.toJS() : (Array.isArray(rawXattr) ? rawXattr : []);
-          if (xattrArr && xattrArr.length > 0) xattr = xattrArr;
-        } catch (e) { xattr = null; }
-      }
-
-      // textContent for text-bearing types
-      var text = null;
-      if (includeText && type && TEXT_BEARING_TYPES[type]) {
-        try { var t = extractText(node, 200); if (t) text = t; }
-        catch (e) { text = null; }
-      }
-
-      // Filtering
+    function applyFiltersAndPush(entry, type, classes, text) {
       if (filterType && type !== filterType) return;
       if (filterClassLower) {
         var match = classes.some(function(c) {
@@ -2152,20 +2207,46 @@
         if (!text || text.toLowerCase().indexOf(filterTextLower) === -1) return;
       }
       if (!includeEmpty && classes.length === 0 && type !== 'Section' && type !== 'Body') return;
-
-      var entry;
-      if (compact) {
-        entry = { d: depth, type: type, classes: classes };
-      } else {
-        entry = { depth: depth, type: type, tag: tag, id: id, classes: classes };
-        if (attr) entry.attr = attr;
-        if (xattr) entry.xattr = xattr;
-        if (text) entry.text = text;
-      }
       out.push(entry);
+    }
+
+    helpers.walkTree(root, function(node, depth) {
+      totalWalked++;
+      var built = buildEntry(node, depth, sbs, entryOpts);
+
+      // hideTemplateRoots: skip nodes that are template roots at the natural depth 1
+      if (hideTemplateRoots && expandComponents && depth === 1 && built.symInfo && built.symInfo.root === true) {
+        return;
+      }
+
+      applyFiltersAndPush(built.entry, built.type, built.classes, built.text);
+
+      // expandComponents: for Symbol instances, walk their template inline
+      if (expandComponents && built.type === 'Symbol' && built.symInfo && built.symInfo.inst) {
+        var template = templatesById[built.symInfo.inst];
+        if (template) {
+          var templateChildren = template.get('children');
+          if (templateChildren && templateChildren.forEach) {
+            templateChildren.forEach(function(childNode) {
+              // Recursive walk of template subtree, with depth offset = symbol.depth + 1
+              helpers.walkTree(childNode, function(tNode, tDepth) {
+                expandedCount++;
+                var tBuilt = buildEntry(tNode, depth + 1 + tDepth, sbs, entryOpts);
+                if (!compact) {
+                  tBuilt.entry.fromTemplate = built.symInfo.inst;
+                  if (built.symInfo.name) tBuilt.entry.fromComponent = built.symInfo.name;
+                }
+                applyFiltersAndPush(tBuilt.entry, tBuilt.type, tBuilt.classes, tBuilt.text);
+              }, { maxDepth: maxDepth });
+            });
+          }
+        }
+      }
     }, { maxDepth: maxDepth });
 
-    return { ok: true, count: out.length, total_walked: totalWalked, tree: out };
+    var result = { ok: true, count: out.length, total_walked: totalWalked, tree: out };
+    if (expandComponents) result.expanded = expandedCount;
+    return result;
   };
 
   console.log('[TreeDump] 1 command registered: dumpTree');
