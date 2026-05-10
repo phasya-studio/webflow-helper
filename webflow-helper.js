@@ -24,7 +24,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '1.5.0';
+  var VERSION = '1.6.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2142,7 +2142,11 @@
    * @param {boolean} [args.includeXattr=true] Include data.xattr (custom attributes data-*, role, aria-*) — only if non-empty
    * @param {boolean} [args.expandComponents=false] When a Symbol is found, lookup its template via data.sym.inst and walk it inline as virtual children (depth offset). Each expanded node gets `fromTemplate: <inst-id>`. Template roots (data.sym.root=true) at depth 1 of root tree are NOT skipped from main walk by default (cf hideTemplateRoots).
    * @param {boolean} [args.hideTemplateRoots=false] When expandComponents=true, set this to true to filter out the original template root nodes (depth 1 with sym.root=true) from the main output to avoid duplication. Default false (templates appear both as their root + inline under Symbol instances).
-   * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, error?: string }}
+   * @param {string}  [args.rootId]            v1.6.0 — Scope walk to subtree rooted at this node ID (default: body root). Reduces payload 5-10× when working in a known subsection. Returns error if ID not found.
+   * @param {boolean} [args.includeParent=false] v1.6.0 — Add `parent_id` field to each entry (computed via depth-based stack during walk). Replaces the JS-side `findIndex + walk back` pattern. Only set when not compact. Skipped on virtual nodes from expandComponents.
+   * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, hint?: string, scoped_to?: string, error?: string }}
+   *
+   * v1.6.0 hint heuristics: when count===0, the response includes a `hint` field describing the most likely cause (low maxDepth, page not loaded, class spelling, text on non-text-bearing nodes). Empty hint = filter just doesn't match anything.
    */
   p._localCmd.dumpTree = function(args) {
     args = args || {};
@@ -2154,6 +2158,8 @@
     var compact = args.compact === true;
     var expandComponents = args.expandComponents === true;
     var hideTemplateRoots = args.hideTemplateRoots === true;
+    var rootIdScope = args.rootId || null;          // v1.6.0
+    var includeParent = args.includeParent === true; // v1.6.0
     var entryOpts = {
       compact: compact,
       includeText: args.includeText !== false && !compact,
@@ -2161,8 +2167,15 @@
       includeXattr: args.includeXattr !== false && !compact
     };
 
-    var root = helpers.getRoot();
-    if (!root) return { ok: false, error: 'No root node — Designer not loaded?' };
+    // v1.6.0 — root scoping
+    var root;
+    if (rootIdScope) {
+      root = helpers.findNodeById(rootIdScope);
+      if (!root) return { ok: false, error: 'Node not found by id: ' + rootIdScope };
+    } else {
+      root = helpers.getRoot();
+      if (!root) return { ok: false, error: 'No root node — Designer not loaded?' };
+    }
 
     // Resolve styleBlocks once for the entire walk.
     var sbs = null;
@@ -2194,6 +2207,7 @@
     var out = [];
     var totalWalked = 0;
     var expandedCount = 0;
+    var parentStack = []; // v1.6.0 — [{ depth, id }] for includeParent
 
     function applyFiltersAndPush(entry, type, classes, text) {
       if (filterType && type !== filterType) return;
@@ -2212,12 +2226,30 @@
 
     helpers.walkTree(root, function(node, depth) {
       totalWalked++;
+
+      // v1.6.0 — maintain parent stack for includeParent
+      while (parentStack.length > 0 && parentStack[parentStack.length - 1].depth >= depth) {
+        parentStack.pop();
+      }
+
       var built = buildEntry(node, depth, sbs, entryOpts);
 
       // hideTemplateRoots: skip nodes that are template roots at the natural depth 1
       if (hideTemplateRoots && expandComponents && depth === 1 && built.symInfo && built.symInfo.root === true) {
+        // Still update parent stack for descendants
+        var skippedId = node.get && node.get('id');
+        if (skippedId) parentStack.push({ depth: depth, id: skippedId });
         return;
       }
+
+      // v1.6.0 — set parent_id from stack top if includeParent + not compact
+      if (includeParent && !compact && parentStack.length > 0) {
+        built.entry.parent_id = parentStack[parentStack.length - 1].id;
+      }
+
+      // Push current node on stack BEFORE filters/expand (children of current node need its id as parent)
+      var currentId = node.get && node.get('id');
+      if (currentId) parentStack.push({ depth: depth, id: currentId });
 
       applyFiltersAndPush(built.entry, built.type, built.classes, built.text);
 
@@ -2246,6 +2278,26 @@
 
     var result = { ok: true, count: out.length, total_walked: totalWalked, tree: out };
     if (expandComponents) result.expanded = expandedCount;
+    if (rootIdScope) result.scoped_to = rootIdScope;
+
+    // v1.6.0 — hint heuristics for count===0
+    if (out.length === 0) {
+      var hint = null;
+      var hasFilter = !!(filterClassLower || filterTextLower || filterType);
+      if (hasFilter && totalWalked < 50) {
+        hint = 'Tree shallow (' + totalWalked + ' nodes walked) — page may not be fully loaded · check Designer page tab + reload if needed';
+      } else if (filterClassLower && maxDepth < 12 && totalWalked < 200) {
+        hint = "No match for class '" + args.filterClass + "' at maxDepth=" + maxDepth + " (walked " + totalWalked + ') — Webflow cards typically at depth 8-10, try maxDepth>=12 or remove maxDepth (default 50)';
+      } else if (filterClassLower) {
+        hint = "No match for class '" + args.filterClass + "' (case-insensitive substring · walked " + totalWalked + ') — check spelling';
+      } else if (filterTextLower) {
+        hint = "No match for text '" + args.filterText + "' — text only checked on text-bearing types (Heading, Paragraph, TextLink, Button, Span, Link, NavbarLink, DropdownLink, NavbarBrand, FormBlockLabel, Blockquote) · try filterClass instead";
+      } else if (filterType) {
+        hint = "No node of type '" + args.filterType + "' (walked " + totalWalked + ')';
+      }
+      if (hint) result.hint = hint;
+    }
+
     return result;
   };
 
