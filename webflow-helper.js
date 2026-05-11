@@ -1,20 +1,27 @@
-/* Webflow Helper v3.3.0 - 2026-05-11 */
+/* Webflow Helper v3.4.0 - 2026-05-11 */
 
 /**
- * Webflow Helper — minimal surface, exposes 9 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
  * 3. appendHtmlEmbedViaUI — create a HtmlEmbed via UI automation (Add panel + paste + Save)
  * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click)
  * 5. renameNode — rename any node (HtmlEmbed, DIV, Section, etc.) via 3 Redux dispatches (v3.1.0)
- * 6. listEmbeds — list embeds + their contents (no MCP tool)
- * 7. getEmbedContent — read a single embed's content (no MCP tool)
- * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
- * 9. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
- *    + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
- *      (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
- *      from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ * 6. setComponentPropsViaUI — override ComponentInstance properties via UI automation (v3.4.0)
+ * 7. listEmbeds — list embeds + their contents (no MCP tool)
+ * 8. getEmbedContent — read a single embed's content (no MCP tool)
+ * 9. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 10. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
+ *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
+ *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.4.0 (s548) : setComponentPropsViaUI — UI automation pour overrides primary
+ * locale des ComponentInstance (gap MCP Data API documenté Webflow). Vague 1 = text-only
+ * (Question/Réponse/CTA Text). Pattern : sélection préalable via mcp__webflow__element_tool.select_element
+ * → cmd applique chaque prop via React nativeInputValueSetter + input event + blur commit.
+ * Compatible s548 : aucun dispatch Redux write (only DOM events captured by Webflow React handler).
  *
  * MINOR v3.3.0 (s548) : dumpTree `expandSlotOverrides` — révèle les ComponentInstance
  * imbriquées dans des slots avec leurs prop values (Question/Réponse/CTA Text/CTA Lien
@@ -47,7 +54,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.3.0';
+  var VERSION = '3.4.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2070,6 +2077,140 @@
 // gates `__webflowHelper.run('X', args)`.
 // ============================================================================
 
+/**
+ * ComponentProps — UI automation pour overrides de properties sur ComponentInstance.
+ *
+ * Cmd: setComponentPropsViaUI({nodeId, props, waitMs?})
+ *
+ * Workflow (v3.4.0 — Vague 1 text-only) :
+ * 1. Sélection MCP-equivalent : trouver le node natif dans le DOM canvas via data-w-id,
+ *    cliquer pour ouvrir le panel Properties à droite (TOP window).
+ * 2. Pour chaque prop dans `props` map :
+ *    - Lookup l'input via `[data-automation-id="Type--Plugin_List_<propName>"]`
+ *    - Selon `type` : text → React nativeInputValueSetter + input event + blur
+ *    - (Vague 2 ajoutera : link, visibility, image, etc.)
+ * 3. Retour `{ok, applied: [propName], failed: [{propName, reason}], durationMs}`
+ *
+ * Notes empiriques s548 :
+ * - Le pattern `MouseEvent` direct sur le canvas iframe ne déclenche pas la sélection
+ *   Webflow (overlay React intercepte). Workaround : utiliser MCP `element_tool.select_element`
+ *   AVANT cette cmd, OU laisser le user pré-sélectionner manuellement.
+ * - Le `nativeInputValueSetter` bypass React controlled inputs (validé empirique).
+ * - Le commit Redux + WebSocket se fait au `blur` event (pas besoin de Save click).
+ *
+ * Compatibilité s548 : aucun dispatch Redux write — uniquement events DOM
+ * (focus/input/change/blur). Webflow React handler capture et dispatch en interne.
+ */
+(function() {
+  'use strict';
+
+  if (!window.__webflowHelper) return;
+  var p = window.__webflowHelper;
+  if (!p._localCmd) p._localCmd = {};
+
+  // Sélecteur générique pour les inputs de prop dans le panel Properties.
+  // Pattern Webflow Designer : `data-automation-id="Type--Plugin_List_<propName>"`
+  // où <propName> est le nom humain de la prop (ex: "Question", "Réponse", "CTA Text").
+  function findPropInput(propName) {
+    var selector = '[data-automation-id="Type--Plugin_List_' + propName + '"]';
+    return document.querySelector(selector);
+  }
+
+  // React-compatible input value setter — bypass React controlled inputs.
+  // Sans ce pattern, `input.value = "..."` est ignoré silencieusement par React.
+  function setReactInputValue(input, value) {
+    var proto = input.tagName === 'TEXTAREA'
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    nativeSetter.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  // Apply 1 prop override via UI. Returns null on success, error string on failure.
+  function applyTextProp(propName, value) {
+    var input = findPropInput(propName);
+    if (!input) {
+      return 'input_not_found (selector: [data-automation-id="Type--Plugin_List_' + propName + '"]) — vérifier que panel Properties est ouvert sur la bonne instance';
+    }
+    if (input.tagName !== 'INPUT' && input.tagName !== 'TEXTAREA') {
+      return 'unexpected_tag: ' + input.tagName + ' (attendu INPUT/TEXTAREA pour type=text)';
+    }
+    try {
+      input.focus();
+      setReactInputValue(input, value);
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+      return null; // success
+    } catch (e) {
+      return 'error: ' + e.message;
+    }
+  }
+
+  p._localCmd.setComponentPropsViaUI = async function(args) {
+    args = args || {};
+    var startMs = Date.now();
+    var props = args.props || {};
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 200;
+
+    var applied = [];
+    var failed = [];
+
+    // Validation initiale : panel Properties doit être ouvert (instance sélectionnée préalable).
+    var panel = document.querySelector('[data-automation-id="componentInstanceProperties"]');
+    if (!panel) {
+      return {
+        ok: false,
+        error: 'panel_not_open',
+        message: 'Le panel Properties n\'est pas ouvert. Sélectionner l\'instance via mcp__webflow__element_tool.select_element AVANT cet appel.',
+        durationMs: Date.now() - startMs
+      };
+    }
+
+    // Boucle sur les props demandées
+    var propNames = Object.keys(props);
+    for (var i = 0; i < propNames.length; i++) {
+      var name = propNames[i];
+      var spec = props[name];
+      if (!spec || typeof spec !== 'object') {
+        failed.push({ propName: name, reason: 'invalid_spec (attendu objet {type, value})' });
+        continue;
+      }
+
+      var type = spec.type;
+      var value = spec.value;
+
+      if (type === 'text') {
+        if (typeof value !== 'string') {
+          failed.push({ propName: name, reason: 'invalid_value (type=text requiert string)' });
+          continue;
+        }
+        var err = applyTextProp(name, value);
+        if (err) {
+          failed.push({ propName: name, reason: err });
+        } else {
+          applied.push(name);
+        }
+      } else {
+        // Vague 2 : link, visibility, image, etc.
+        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (Vague 1 supporte uniquement type=text · Vague 2 ajoutera link/visibility/image)' });
+      }
+
+      // Petit délai entre props pour éviter race condition React renders
+      await new Promise(function(r) { setTimeout(r, waitMs); });
+    }
+
+    return {
+      ok: failed.length === 0,
+      applied: applied,
+      failed: failed,
+      durationMs: Date.now() - startMs
+    };
+  };
+
+  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (text type only — Vague 1)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -2082,6 +2223,7 @@
     'appendHtmlEmbedViaUI',
     'updateEmbedViaUI',
     'renameNode',
+    'setComponentPropsViaUI',
     'listEmbeds',
     'getEmbedContent',
     'getCurrentPageInfo',
