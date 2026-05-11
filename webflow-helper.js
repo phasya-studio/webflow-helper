@@ -1,16 +1,17 @@
-/* Webflow Helper v3.0.0 - 2026-05-11 */
+/* Webflow Helper v3.1.0 - 2026-05-11 */
 
 /**
- * Webflow Helper — minimal surface, exposes 8 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 9 cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
  * 3. appendHtmlEmbedViaUI — create a HtmlEmbed via UI automation (Add panel + paste + Save)
  * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click)
- * 5. listEmbeds — list embeds + their contents (no MCP tool)
- * 6. getEmbedContent — read a single embed's content (no MCP tool)
- * 7. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
- * 8. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ * 5. renameNode — rename any node (HtmlEmbed, DIV, Section, etc.) via 3 Redux dispatches (v3.1.0)
+ * 6. listEmbeds — list embeds + their contents (no MCP tool)
+ * 7. getEmbedContent — read a single embed's content (no MCP tool)
+ * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 9. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
  *
  * BREAKING v3.0.0 (s547) : removed `appendHtmlEmbedWS` (silent reject empirique :
  * server ACK received but embed not in AbstractNodeStore after 5000ms) et `setEmbedHasScript`
@@ -33,7 +34,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.0.0';
+  var VERSION = '3.1.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -67,6 +68,7 @@
   var WRITE_COMMANDS = {
     appendHtmlEmbedViaUI: true,
     updateEmbedViaUI: true,
+    renameNode: true,
     switchPage: true
   };
 
@@ -465,7 +467,7 @@
 /**
  * CodeEmbed — HtmlEmbed read/write via Redux + WebSocket.
  *
- * Cmds: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI.
+ * Cmds: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI, renameNode.
  *
  * Persistence (UI save reverse-engineered): socket message `siteData:update` with
  * - actionType=HTML_EMBED_TEXT_SAVED
@@ -1080,7 +1082,132 @@
     };
   };
 
-  console.log('[CodeEmbed] 4 commands registered: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI.');
+  /**
+   * Rename a node (HtmlEmbed, DIV, Section, etc.) via 3 Redux dispatches.
+   *
+   * Reverse-engineered empirically session s547 : le rename UI Navigator déclenche
+   * 3 actions Redux séquentielles qui modifient le state + dispatchent le frame
+   * `siteData:update` (`expressionDiff` type `updateMeta` + `metadataDiffs`).
+   * Aucune dépendance à un workflow UI complexe (pas de double-clic Navigator,
+   * pas de localisation de tree row React).
+   *
+   * Actions Redux dispatchées :
+   *   1. RENAME_TRIGGERED { source: 'navigator', trigger: 'double-click' }
+   *      → ouvre l'input rename dans le Navigator (input visible focused)
+   *   2. ELEMENT_RENAMED { newName, source: 'navigator', trigger: 'double-click' }
+   *      → set le nouveau nom dans le state (utilise selectedNodeNativeId comme cible)
+   *   3. FLUSH_RENAME_TRIGGERED {}
+   *      → envoie le frame siteData:update au server (persistance)
+   *
+   * + Enter key dispatch sur l'input actif pour fermer le mode édition UI proprement
+   *   (le save server-side a déjà eu lieu à FLUSH — c'est juste cleanup visuel).
+   *
+   * Marche sur n'importe quel type de node, pas seulement HtmlEmbed.
+   *
+   * @param {object} args
+   * @param {string} args.nodeId               native id du node à renommer (canvas data-w-id ou Webflow native id)
+   * @param {string} args.newName              nouveau nom du node
+   * @param {object} [args.waitMs]             override per-step delays
+   * @returns {Promise<object>} `{ ok, success, nodeId, newName, durationMs, error? }`
+   *
+   * @see docs/lessons/webflow-helper-canon.md §renamenode
+   */
+  p._localCmd.renameNode = async function(args) {
+    args = args || {};
+    var nodeId = args.nodeId;
+    var newName = args.newName;
+    var waitMs = args.waitMs || {};
+
+    if (!nodeId) return { ok: false, error: 'nodeId required' };
+    if (typeof newName !== 'string') return { ok: false, error: 'newName (string) required' };
+    if (!newName.trim()) return { ok: false, error: 'newName cannot be empty' };
+
+    var DELAYS = {
+      afterDeselect: waitMs.afterDeselect || 250,
+      afterSelect: waitMs.afterSelect || 500,
+      afterRenameTriggered: waitMs.afterRenameTriggered || 100,
+      afterElementRenamed: waitMs.afterElementRenamed || 100,
+      afterFlush: waitMs.afterFlush || 1500,
+      afterEnterCleanup: waitMs.afterEnterCleanup || 300
+    };
+
+    function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+    var start = Date.now();
+
+    // 1. Locate canvas iframe
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    if (!canvas) return { ok: false, error: 'canvas iframe not found' };
+    var canvasDoc = canvas.contentDocument;
+    if (!canvasDoc) return { ok: false, error: 'canvas iframe contentDocument not accessible' };
+
+    var webflowStore = window._webflow;
+    if (!webflowStore || !webflowStore.dispatch) return { ok: false, error: 'Webflow store/dispatch not accessible' };
+    var uiNode = webflowStore.stores && webflowStore.stores.UiNodeStore;
+    if (!uiNode) return { ok: false, error: 'UiNodeStore not accessible' };
+
+    // STEP 1: Deselect (clean state)
+    canvasDoc.body.click();
+    await wait(DELAYS.afterDeselect);
+
+    // STEP 2: Select target node in canvas (canvas click triggers NODE_CLICKED → selection)
+    var targetEl = canvasDoc.querySelector('[data-w-id="' + nodeId + '"]');
+    if (!targetEl) {
+      // Try data-wf-id PATH for Component-nested nodes
+      targetEl = canvasDoc.querySelector('[data-wf-id*="' + nodeId + '"]');
+      if (!targetEl) return { ok: false, error: 'node not found in canvas: ' + nodeId };
+    }
+    targetEl.click();
+    await wait(DELAYS.afterSelect);
+
+    if (uiNode.state.selectedNodeNativeId !== nodeId) {
+      return {
+        ok: false,
+        error: 'node selection failed',
+        selectedNode: uiNode.state.selectedNodeNativeId,
+        expectedNode: nodeId
+      };
+    }
+
+    // STEP 3: Dispatch RENAME_TRIGGERED → opens rename input in Navigator
+    webflowStore.dispatch({type: 'RENAME_TRIGGERED', payload: {source: 'navigator', trigger: 'double-click'}});
+    await wait(DELAYS.afterRenameTriggered);
+
+    // STEP 4: Dispatch ELEMENT_RENAMED → sets new name in state (uses current selection)
+    webflowStore.dispatch({type: 'ELEMENT_RENAMED', payload: {newName: newName, source: 'navigator', trigger: 'double-click'}});
+    await wait(DELAYS.afterElementRenamed);
+
+    // STEP 5: Dispatch FLUSH_RENAME_TRIGGERED → sends siteData:update frame to server
+    webflowStore.dispatch({type: 'FLUSH_RENAME_TRIGGERED', payload: {}});
+    await wait(DELAYS.afterFlush);
+
+    // STEP 6: UI cleanup — dispatch Enter key on the active input to close edit mode
+    // (server save already happened at FLUSH; this just closes the visible input)
+    var activeInput = document.activeElement;
+    if (activeInput && activeInput.tagName === 'INPUT') {
+      ['keydown', 'keypress', 'keyup'].forEach(function(type) {
+        activeInput.dispatchEvent(new KeyboardEvent(type, {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+          bubbles: true, cancelable: true
+        }));
+      });
+      await wait(DELAYS.afterEnterCleanup);
+    }
+
+    // STEP 7: Validate via Navigator DOM
+    var treeView = document.querySelector('[data-automation-id="tree-view-container"]');
+    var domHasName = treeView ? treeView.textContent.includes(newName) : false;
+
+    return {
+      ok: domHasName,
+      success: domHasName,
+      nodeId: nodeId,
+      newName: newName,
+      durationMs: Date.now() - start,
+      error: domHasName ? undefined : 'new name not found in Navigator DOM after rename'
+    };
+  };
+
+  console.log('[CodeEmbed] 5 commands registered: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI, renameNode.');
 })();
 
 /**
@@ -2038,15 +2165,16 @@
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
 // only the 7 whitelisted cmds are callable via `__webflowHelper.run(name)`.
 //
-// Whitelisted cmds (8):
+// Whitelisted cmds (9):
 // 1. switchPage - MCP de_page_tool.switch_page 70% timeout
 // 2. launchBridgeApp - not in MCP
 // 3. appendHtmlEmbedViaUI - MCP gap (HtmlEmbed creation via UI automation — v3.0.0 remplace appendHtmlEmbedWS obsolète)
 // 4. updateEmbedViaUI - MCP gap (embed content update via UI automation — v2.0.0 remplace updateEmbed obsolète)
-// 5. listEmbeds - MCP gap (embed list + contents)
-// 6. getEmbedContent - MCP gap (single embed content read)
-// 7. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
-// 8. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+// 5. renameNode - MCP gap (node rename via 3 Redux dispatches — v3.1.0)
+// 6. listEmbeds - MCP gap (embed list + contents)
+// 7. getEmbedContent - MCP gap (single embed content read)
+// 8. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
+// 9. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
 //
 // NOTE v3.0.0 : setEmbedHasScript retirée (redundant — Webflow auto-pose le flag w-script
 // au Save UI quand le content contient `<script>`).
@@ -2067,6 +2195,7 @@
     'launchBridgeApp',
     'appendHtmlEmbedViaUI',
     'updateEmbedViaUI',
+    'renameNode',
     'listEmbeds',
     'getEmbedContent',
     'getCurrentPageInfo',
