@@ -1,4 +1,4 @@
-/* Webflow Helper v3.4.0 - 2026-05-11 */
+/* Webflow Helper v3.5.0 - 2026-05-11 */
 
 /**
  * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
@@ -8,7 +8,7 @@
  * 3. appendHtmlEmbedViaUI — create a HtmlEmbed via UI automation (Add panel + paste + Save)
  * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click)
  * 5. renameNode — rename any node (HtmlEmbed, DIV, Section, etc.) via 3 Redux dispatches (v3.1.0)
- * 6. setComponentPropsViaUI — override ComponentInstance properties via UI automation (v3.4.0)
+ * 6. setComponentPropsViaUI — override ComponentInstance properties via UI automation (v3.4.0/v3.5.0)
  * 7. listEmbeds — list embeds + their contents (no MCP tool)
  * 8. getEmbedContent — read a single embed's content (no MCP tool)
  * 9. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
@@ -16,6 +16,10 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.5.0 (s548 · Vague 2 partielle) : setComponentPropsViaUI étendu — supporte
+ * désormais `type: 'link'` (mode='page' avec pageSlug, mode='url' avec url) +
+ * `type: 'visibility'` (visible boolean). Total : 3 types couverts (text + link + visibility).
  *
  * MINOR v3.4.0 (s548) : setComponentPropsViaUI — UI automation pour overrides primary
  * locale des ComponentInstance (gap MCP Data API documenté Webflow). Vague 1 = text-only
@@ -54,7 +58,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.4.0';
+  var VERSION = '3.5.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2147,6 +2151,81 @@
     }
   }
 
+  // v3.5.0 — Link prop : mode=page (via page picker) ou mode=url (input external URL).
+  // Le wrapper est scopé à `[data-automation-id="ExpressionEditor-fieldWrapper-<propName>"]`
+  // pour éviter ambiguïté avec d'autres props.
+  async function applyLinkProp(propName, spec) {
+    var wrapper = document.querySelector('[data-automation-id="ExpressionEditor-fieldWrapper-' + propName + '"]');
+    if (!wrapper) return 'wrapper_not_found pour prop link "' + propName + '"';
+
+    var mode = spec.mode;
+    if (mode !== 'page' && mode !== 'url') {
+      return 'link_mode_not_supported: "' + mode + '" (Vague 2 supporte mode=page et mode=url · email/phone/section/file à venir)';
+    }
+
+    // 1. S'assurer que le Type est correct (click radio si pas déjà actif).
+    var typeButtonId = mode === 'page' ? 'Type--Plugin_Enum_Type_button-page' : 'Type--Plugin_Enum_Type_button-external';
+    var typeBtn = wrapper.querySelector('[data-automation-id="' + typeButtonId + '"]');
+    if (!typeBtn) return 'type_button_not_found: ' + typeButtonId;
+    if (typeBtn.getAttribute('aria-checked') !== 'true') {
+      typeBtn.click();
+      await new Promise(function(r) { setTimeout(r, 200); });
+    }
+
+    if (mode === 'page') {
+      if (!spec.pageSlug || typeof spec.pageSlug !== 'string') {
+        return 'invalid_pageSlug (requis pour mode=page, ex: "contact" ou "plateaux-repas" — correspond au data-automation-id "{slug}-page")';
+      }
+      // 2a. Click sur page-selector-button pour ouvrir le popover
+      var selectorBtn = wrapper.querySelector('[data-automation-id="page-selector-button"]');
+      if (!selectorBtn) return 'page-selector-button_not_found dans wrapper';
+      selectorBtn.click();
+      await new Promise(function(r) { setTimeout(r, 400); });
+
+      // 3a. Click sur l'option {pageSlug}-page dans le popover
+      var pageOption = document.querySelector('[data-automation-id="' + spec.pageSlug + '-page"]');
+      if (!pageOption) {
+        // Fermer le popover ouvert avant retour erreur
+        document.body.click();
+        return 'page_option_not_found: [data-automation-id="' + spec.pageSlug + '-page"] — vérifier le slug (slug Webflow lowercase avec tirets, ex: "plateaux-repas" pas "Plateaux Repas")';
+      }
+      pageOption.click();
+      await new Promise(function(r) { setTimeout(r, 300); });
+      return null; // success
+    }
+
+    if (mode === 'url') {
+      if (typeof spec.url !== 'string') return 'invalid_url (requis pour mode=url)';
+      // 2b. Trouver l'input URL — pattern Webflow : input de type text dans le wrapper après le type selector
+      var urlInput = wrapper.querySelector('input[type="text"][data-automation-id*="External"], input[type="text"][placeholder*="https"], input[type="text"]:not([data-automation-id*="page-selector"])');
+      if (!urlInput) return 'url_input_not_found (mode=external) — re-tester ou ajouter sélecteur';
+      urlInput.focus();
+      setReactInputValue(urlInput, spec.url);
+      urlInput.dispatchEvent(new Event('change', { bubbles: true }));
+      urlInput.blur();
+      return null;
+    }
+
+    return 'link_mode_unhandled';
+  }
+
+  // v3.5.0 — Visibility (boolean) : 2 buttons Visible/Hidden dans le wrapper.
+  function applyVisibilityProp(propName, visible) {
+    var wrapper = document.querySelector('[data-automation-id="ExpressionEditor-fieldWrapper-' + propName + '"]');
+    if (!wrapper) return 'wrapper_not_found pour prop visibility "' + propName + '"';
+    if (typeof visible !== 'boolean') return 'invalid_value (type=visibility requiert boolean)';
+
+    var targetId = visible ? 'visual-radio-button-True' : 'visual-radio-button-False';
+    var btn = wrapper.querySelector('[data-automation-id="' + targetId + '"]');
+    if (!btn) return 'button_not_found: ' + targetId;
+    if (btn.getAttribute('aria-checked') === 'true') {
+      // Déjà dans l'état désiré — no-op (mais pas une erreur)
+      return null;
+    }
+    btn.click();
+    return null;
+  }
+
   p._localCmd.setComponentPropsViaUI = async function(args) {
     args = args || {};
     var startMs = Date.now();
@@ -2185,15 +2264,20 @@
           failed.push({ propName: name, reason: 'invalid_value (type=text requiert string)' });
           continue;
         }
-        var err = applyTextProp(name, value);
-        if (err) {
-          failed.push({ propName: name, reason: err });
-        } else {
-          applied.push(name);
-        }
+        var errT = applyTextProp(name, value);
+        if (errT) failed.push({ propName: name, reason: errT });
+        else applied.push(name);
+      } else if (type === 'link') {
+        var errL = await applyLinkProp(name, spec);
+        if (errL) failed.push({ propName: name, reason: errL });
+        else applied.push(name);
+      } else if (type === 'visibility') {
+        var errV = applyVisibilityProp(name, spec.visible);
+        if (errV) failed.push({ propName: name, reason: errV });
+        else applied.push(name);
       } else {
-        // Vague 2 : link, visibility, image, etc.
-        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (Vague 1 supporte uniquement type=text · Vague 2 ajoutera link/visibility/image)' });
+        // À venir (Vague 3) : image, number, richText, link mode={email|phone|section|file}
+        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (v3.5.0 supporte text/link(page,url)/visibility · à venir : image/number/richText/link(email,phone,section,file))' });
       }
 
       // Petit délai entre props pour éviter race condition React renders
@@ -2208,7 +2292,7 @@
     };
   };
 
-  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (text type only — Vague 1)');
+  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (types: text · link[page,url] · visibility — Vague 2 partielle)');
 })();
 
 (function filterExposedCmds() {
