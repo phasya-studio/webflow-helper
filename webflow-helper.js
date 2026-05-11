@@ -1,4 +1,4 @@
-/* Webflow Helper v3.5.2 - 2026-05-11 */
+/* Webflow Helper v3.5.3 - 2026-05-12 */
 
 /**
  * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
@@ -16,6 +16,15 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * PATCH v3.5.3 (s549) : 2 fixes critiques sur setComponentPropsViaUI :
+ *   1. applyVisibilityProp — `btn.click()` natif IGNORÉ par les radio Webflow
+ *      (validé empirique : cmd return ok mais aucune mutation store/DOM). Fix =
+ *      focus + KeyboardEvent Space (le pattern qui marche empirique).
+ *   2. Nouveau type `reset` — annule un override pour revenir au default template.
+ *      Pattern UI : click sur le label (data-resettable=true + data-origin=local)
+ *      → menu apparaît avec data-automation-id="component-property-reset" → click.
+ *      Permet de re-mettre une instance à son default sans valeur arbitraire.
  *
  * MINOR v3.5.0 (s548 · Vague 2 partielle) : setComponentPropsViaUI étendu — supporte
  * désormais `type: 'link'` (mode='page' avec pageSlug, mode='url' avec url) +
@@ -58,7 +67,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.5.2';
+  var VERSION = '3.5.3';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2216,6 +2225,9 @@
   }
 
   // v3.5.0 — Visibility (boolean) : 2 buttons Visible/Hidden dans le wrapper.
+  // v3.5.3 — `btn.click()` natif ignoré par les radio Webflow (validé empirique s549 :
+  // Section FAQ Visibility Body, click natif → ok return mais aucune mutation Redux ni DOM).
+  // Fix : focus + KeyboardEvent Space (le pattern qui marche).
   function applyVisibilityProp(propName, visible) {
     var wrapper = document.querySelector('[data-automation-id="ExpressionEditor-fieldWrapper-' + propName + '"]');
     if (!wrapper) return 'wrapper_not_found pour prop visibility "' + propName + '"';
@@ -2228,7 +2240,51 @@
       // Déjà dans l'état désiré — no-op (mais pas une erreur)
       return null;
     }
-    btn.click();
+    // Pattern keyboard Space (validé empirique s549) :
+    // les radio buttons Webflow n'écoutent pas le click natif programmatique,
+    // mais réagissent au keyboard Space sur l'élément focused.
+    try {
+      btn.focus();
+      ['keydown', 'keypress', 'keyup'].forEach(function(type) {
+        btn.dispatchEvent(new KeyboardEvent(type, {
+          key: ' ', code: 'Space', keyCode: 32, which: 32,
+          bubbles: true, cancelable: true
+        }));
+      });
+      return null;
+    } catch (e) {
+      return 'keyboard_dispatch_error: ' + e.message;
+    }
+  }
+
+  // v3.5.3 — Reset override : revient au default value du component template.
+  // Pattern UI : click sur le label de la prop → menu "Reset to default property value"
+  // apparaît avec `data-automation-id="component-property-reset"` → click dessus.
+  // Le label doit avoir `data-resettable="true"` + `data-origin="local"` (= override actif).
+  // Si pas de override actif → no-op (pas une erreur).
+  async function applyResetProp(propName) {
+    var label = document.querySelector('[data-automation-id="Type--Label_' + propName + '"]');
+    if (!label) return 'label_not_found pour prop "' + propName + '" — vérifier que panel Properties est ouvert sur la bonne instance';
+
+    // Si pas de `data-resettable=true` ou `data-origin=local`, pas d'override à reset
+    var origin = label.getAttribute('data-origin');
+    if (origin !== 'local') {
+      return null; // no-op : pas d'override (origin=template/default), pas une erreur
+    }
+
+    // Step 1: click sur le label pour ouvrir le menu reset
+    label.click();
+    await new Promise(function(r) { setTimeout(r, 300); });
+
+    // Step 2: click sur l'item menu reset
+    var resetItem = document.querySelector('[data-automation-id="component-property-reset"]');
+    if (!resetItem) {
+      // Fermer le menu ouvert au cas où
+      document.body.click();
+      return 'reset_menu_item_not_found après click label';
+    }
+    resetItem.click();
+    await new Promise(function(r) { setTimeout(r, 400); });
     return null;
   }
 
@@ -2281,9 +2337,13 @@
         var errV = applyVisibilityProp(name, spec.visible);
         if (errV) failed.push({ propName: name, reason: errV });
         else applied.push(name);
+      } else if (type === 'reset') {
+        var errR = await applyResetProp(name);
+        if (errR) failed.push({ propName: name, reason: errR });
+        else applied.push(name);
       } else {
         // À venir (Vague 3) : image, number, richText, link mode={email|phone|section|file}
-        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (v3.5.0 supporte text/link(page,url)/visibility · à venir : image/number/richText/link(email,phone,section,file))' });
+        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (v3.5.3 supporte text/link(page,url)/visibility/reset · à venir : image/number/richText/link(email,phone,section,file))' });
       }
 
       // Petit délai entre props pour éviter race condition React renders
@@ -2298,7 +2358,7 @@
     };
   };
 
-  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (types: text · link[page,url] · visibility — Vague 2 partielle)');
+  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (types: text · link[page,url] · visibility · reset — v3.5.3)');
 })();
 
 (function filterExposedCmds() {
