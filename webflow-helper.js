@@ -1,16 +1,18 @@
-/* Webflow Helper v1.5.0 - 2026-05-08 */
+/* Webflow Helper v1.7.0 - 2026-05-11 */
 
 /**
- * Webflow Helper — minimal surface, exposes 8 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
  * 3. appendHtmlEmbedWS — create a native HtmlEmbed (no MCP tool covers this)
- * 4. updateEmbed — write content to an existing embed (no MCP tool)
- * 5. listEmbeds — list embeds + their contents (no MCP tool)
- * 6. getEmbedContent — read a single embed's content (no MCP tool)
- * 7. setEmbedHasScript — set the w-script flag retroactively (no MCP tool)
- * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 4. updateEmbed — write content to an existing embed via raw WS (legacy, may fail on Webflow spec drift)
+ * 5. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click) — resilient fallback v1.7.0
+ * 6. listEmbeds — list embeds + their contents (no MCP tool)
+ * 7. getEmbedContent — read a single embed's content (no MCP tool)
+ * 8. setEmbedHasScript — set the w-script flag retroactively (no MCP tool)
+ * 9. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 10. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
  *
  * Any other cmd called via `__webflowHelper.run('X')` returns
  * `{ ok: false, error: 'CMD_NOT_EXPOSED' }`. Everything else uses the official MCP server.
@@ -24,7 +26,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '1.6.0';
+  var VERSION = '1.7.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -58,6 +60,7 @@
   var WRITE_COMMANDS = {
     appendHtmlEmbedWS: true,
     updateEmbed: true,
+    updateEmbedViaUI: true,
     setEmbedHasScript: true,
     switchPage: true
   };
@@ -1128,7 +1131,176 @@
     });
   };
 
-  console.log('[CodeEmbed] 4 commands registered: listEmbeds, getEmbedContent, updateEmbed, setEmbedHasScript.');
+  /**
+   * Update an HtmlEmbed via UI automation — alternative to `updateEmbed`
+   * resilient to Webflow's WebSocket spec drift.
+   *
+   * Workflow (auto-detects native vs Component instance via data-wf-id PATH):
+   *   1. Deselect (canvas body.click)
+   *   2. If embed is nested in a Component instance → double-click instance to enter component view
+   *   3. Click embed in canvas (data-w-id native, or data-wf-id*= for component-nested)
+   *   4. Click "Settings" tab (if Style tab is active)
+   *   5. Click "Open Code Editor" button (data-automation-id="OpenCodeEditor")
+   *   6. Focus .cm-content (CodeMirror v6), selectAll, dispatch paste event with new content
+   *   7. Click "Save & Close" button
+   *   8. (Component only) Exit component view via body.click
+   *   9. Validate via getEmbedContent
+   *
+   * @param {object} args
+   * @param {string} args.embedId
+   * @param {string} args.content                Max ~50K chars (CodeMirror paste handles large fine, server-side limit applies)
+   * @param {object} [args.waitMs]               Override per-step delays (afterDeselect, afterDblClick, afterSelect, afterSettingsTab, afterOpenEditor, afterPaste, afterSave, afterExitComponent)
+   * @returns {Promise<object>} `{ ok, success, embedId, expectedLength, actualLength, delta, inComponent, componentInstanceId, durationMs, error? }`
+   *
+   * @see docs/lessons/webflow-helper-canon.md §updateembedviaui — reverse-engineered selectors + edge cases (session s547)
+   */
+  p._localCmd.updateEmbedViaUI = async function(args) {
+    args = args || {};
+    var embedId = args.embedId;
+    var content = args.content;
+    var waitMs = args.waitMs || {};
+
+    if (!embedId) return { ok: false, error: 'embedId required' };
+    if (typeof content !== 'string') return { ok: false, error: 'content (string) required' };
+
+    var DELAYS = {
+      afterDeselect: waitMs.afterDeselect || 250,
+      afterDblClick: waitMs.afterDblClick || 600,
+      afterSelect: waitMs.afterSelect || 500,
+      afterSettingsTab: waitMs.afterSettingsTab || 500,
+      afterOpenEditor: waitMs.afterOpenEditor || 800,
+      afterPaste: waitMs.afterPaste || 400,
+      afterSave: waitMs.afterSave || 3000,
+      afterExitComponent: waitMs.afterExitComponent || 250
+    };
+
+    function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+    var start = Date.now();
+
+    // 1. Locate canvas iframe (Webflow renders 'site-iframe-next' in current versions)
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    if (!canvas) return { ok: false, error: 'canvas iframe not found' };
+    var canvasDoc = canvas.contentDocument;
+    if (!canvasDoc) return { ok: false, error: 'canvas iframe contentDocument not accessible' };
+
+    // 2. Find embed element + detect Component nesting via data-wf-id PATH
+    var embedEl = canvasDoc.querySelector('[data-w-id="' + embedId + '"]');
+    var isInComponent = false;
+    var componentInstanceId = null;
+
+    if (!embedEl) {
+      embedEl = canvasDoc.querySelector('[data-wf-id*="' + embedId + '"]');
+      if (!embedEl) return { ok: false, error: 'embed not found in canvas DOM', embedId: embedId };
+      try {
+        var path = JSON.parse(embedEl.getAttribute('data-wf-id') || '[]');
+        if (Array.isArray(path) && path.length > 1) {
+          isInComponent = true;
+          componentInstanceId = path[0];
+        }
+      } catch(e) {}
+    }
+
+    // 3. Get UiNodeStore for selection verification
+    var store = window._webflow;
+    if (!store || !store.stores || !store.stores.UiNodeStore) {
+      return { ok: false, error: 'Webflow store not accessible' };
+    }
+    var uiNode = store.stores.UiNodeStore;
+
+    // STEP 1: Deselect (clean state)
+    canvasDoc.body.click();
+    await wait(DELAYS.afterDeselect);
+
+    // STEP 2: Enter component view (Component case only)
+    if (isInComponent) {
+      var instanceEl = canvasDoc.querySelector('[data-w-id="' + componentInstanceId + '"]');
+      if (!instanceEl) return { ok: false, error: 'component instance not found: ' + componentInstanceId };
+      var rect = instanceEl.getBoundingClientRect();
+      var x = rect.left + rect.width / 2;
+      var y = rect.top + Math.min(rect.height / 2, 40);
+      instanceEl.click();
+      await wait(150);
+      instanceEl.dispatchEvent(new MouseEvent('dblclick', {
+        view: canvas.contentWindow,
+        bubbles: true, cancelable: true,
+        clientX: x, clientY: y, button: 0, detail: 2
+      }));
+      await wait(DELAYS.afterDblClick);
+    }
+
+    // STEP 3: Click embed in canvas
+    embedEl.click();
+    await wait(DELAYS.afterSelect);
+
+    if (uiNode.state.selectedNodeNativeId !== embedId) {
+      return {
+        ok: false,
+        error: 'embed selection failed',
+        selectedNode: uiNode.state.selectedNodeNativeId,
+        expectedNode: embedId
+      };
+    }
+
+    // STEP 4: Click Settings tab
+    var settingsTab = document.querySelector('[data-automation-id="right-sidebar-settings-tab-link"]');
+    if (!settingsTab) return { ok: false, error: 'Settings tab not found' };
+    settingsTab.click();
+    await wait(DELAYS.afterSettingsTab);
+
+    // STEP 5: Click Open Code Editor
+    var openBtn = document.querySelector('button[data-automation-id="OpenCodeEditor"]');
+    if (!openBtn) return { ok: false, error: 'OpenCodeEditor button not found (settings panel did not render?)' };
+    openBtn.click();
+    await wait(DELAYS.afterOpenEditor);
+
+    // STEP 6: Paste content via ClipboardEvent on .cm-content (CodeMirror v6 contenteditable)
+    var cmContent = document.querySelector('.cm-content');
+    if (!cmContent) return { ok: false, error: 'CodeMirror .cm-content not present (modal did not mount?)' };
+    cmContent.focus();
+    var sel = document.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(cmContent);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    var dt = new DataTransfer();
+    dt.setData('text/plain', content);
+    cmContent.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    await wait(DELAYS.afterPaste);
+
+    // STEP 7: Click Save & Close (text-based since no data-automation-id on this button)
+    var saveCloseBtn = Array.from(document.querySelectorAll('button')).find(function(b) {
+      return (b.textContent || '').trim() === 'Save & Close';
+    });
+    if (!saveCloseBtn) return { ok: false, error: 'Save & Close button not found' };
+    saveCloseBtn.click();
+    await wait(DELAYS.afterSave);
+
+    // STEP 8: Exit component view if entered (clean state for chained calls)
+    if (isInComponent) {
+      canvasDoc.body.click();
+      await wait(DELAYS.afterExitComponent);
+    }
+
+    // STEP 9: Validate via getEmbedContent (synchronous read from Redux post-Save)
+    var verify = p._localCmd.getEmbedContent({ embedId: embedId });
+    var success = !!(verify && verify.ok && verify.value === content);
+
+    return {
+      ok: success,
+      success: success,
+      embedId: embedId,
+      expectedLength: content.length,
+      actualLength: verify && verify.length,
+      delta: content.length - ((verify && verify.length) || 0),
+      inComponent: isInComponent,
+      componentInstanceId: componentInstanceId,
+      durationMs: Date.now() - start,
+      error: success ? undefined : 'content verification mismatch after save (expected ' + content.length + ' chars, got ' + (verify && verify.length) + ')',
+      verify_ok: !!(verify && verify.ok)
+    };
+  };
+
+  console.log('[CodeEmbed] 5 commands registered: listEmbeds, getEmbedContent, updateEmbed, updateEmbedViaUI, setEmbedHasScript.');
 })();
 
 /**
@@ -2501,16 +2673,17 @@
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
 // only the 7 whitelisted cmds are callable via `__webflowHelper.run(name)`.
 //
-// Whitelisted cmds (9):
+// Whitelisted cmds (10):
 // 1. switchPage - MCP de_page_tool.switch_page 70% timeout
 // 2. launchBridgeApp - not in MCP
 // 3. appendHtmlEmbedWS - MCP gap (HtmlEmbed creation)
-// 4. updateEmbed - MCP gap (embed content update)
-// 5. listEmbeds - MCP gap (embed list + contents)
-// 6. getEmbedContent - MCP gap (single embed content read)
-// 7. setEmbedHasScript - MCP gap (w-script flag)
-// 8. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
-// 9. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+// 4. updateEmbed - MCP gap (embed content update via raw WS — legacy)
+// 5. updateEmbedViaUI - MCP gap (embed content update via UI automation — resilient v1.7.0)
+// 6. listEmbeds - MCP gap (embed list + contents)
+// 7. getEmbedContent - MCP gap (single embed content read)
+// 8. setEmbedHasScript - MCP gap (w-script flag)
+// 9. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
+// 10. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
 //
 // Bypass: `window.__webflowHelper._localCmd.X(args)` is still callable for
 // debugging or one-off direct access (manual audit trail). The wrapper only
@@ -2528,6 +2701,7 @@
     'launchBridgeApp',
     'appendHtmlEmbedWS',
     'updateEmbed',
+    'updateEmbedViaUI',
     'listEmbeds',
     'getEmbedContent',
     'setEmbedHasScript',
