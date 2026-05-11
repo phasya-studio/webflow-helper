@@ -1,18 +1,23 @@
-/* Webflow Helper v1.7.0 - 2026-05-11 */
+/* Webflow Helper v2.0.0 - 2026-05-11 */
 
 /**
- * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 9 cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
  * 3. appendHtmlEmbedWS — create a native HtmlEmbed (no MCP tool covers this)
- * 4. updateEmbed — write content to an existing embed via raw WS (legacy, may fail on Webflow spec drift)
- * 5. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click) — resilient fallback v1.7.0
- * 6. listEmbeds — list embeds + their contents (no MCP tool)
- * 7. getEmbedContent — read a single embed's content (no MCP tool)
- * 8. setEmbedHasScript — set the w-script flag retroactively (no MCP tool)
- * 9. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
- * 10. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click) · resilient à la spec drift WebSocket
+ * 5. listEmbeds — list embeds + their contents (no MCP tool)
+ * 6. getEmbedContent — read a single embed's content (no MCP tool)
+ * 7. setEmbedHasScript — set the w-script flag retroactively (no MCP tool)
+ * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 9. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ *
+ * BREAKING v2.0.0 (s547) : removed `updateEmbed` (raw WebSocket dispatch). Webflow
+ * a changé la spec `siteData:update` (`expressionDiff` remplace `diffs` · format Immutable
+ * path) — la cmd legacy retournait `[Conflict] component map`. Remplacée par
+ * `updateEmbedViaUI` qui orchestre l'UI (CodeMirror paste + Save click) — résilient aux
+ * futurs changements server-side.
  *
  * Any other cmd called via `__webflowHelper.run('X')` returns
  * `{ ok: false, error: 'CMD_NOT_EXPOSED' }`. Everything else uses the official MCP server.
@@ -26,7 +31,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '1.7.0';
+  var VERSION = '2.0.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -59,7 +64,6 @@
   // version-vector conflicts. Reads bypass the queue.
   var WRITE_COMMANDS = {
     appendHtmlEmbedWS: true,
-    updateEmbed: true,
     updateEmbedViaUI: true,
     setEmbedHasScript: true,
     switchPage: true
@@ -460,7 +464,7 @@
 /**
  * CodeEmbed — HtmlEmbed read/write via Redux + WebSocket.
  *
- * Cmds: listEmbeds, getEmbedContent, updateEmbed, setEmbedHasScript.
+ * Cmds: listEmbeds, getEmbedContent, updateEmbedViaUI, setEmbedHasScript.
  *
  * Persistence (UI save reverse-engineered): socket message `siteData:update` with
  * - actionType=HTML_EMBED_TEXT_SAVED
@@ -492,11 +496,13 @@
   p._internal = p._internal || {};
   p._internal.consumeMessageId = consumeMessageId;
   p._internal.getAckDispatcher = getAckDispatcher;
-  // embedsRegistry — shared between appendHtmlEmbedWS (write) and updateEmbed/
-  // setEmbedHasScript (read fallback) so updateEmbed works immediately after a
-  // creation without waiting for Redux dispatch. Cap LRU 200 + TTL 30 min to avoid
-  // memory leak in long sessions. Key = embedId, value = {value, hasScript, parentId,
-  // createdAt, updatedAt}.
+  // embedsRegistry — shared between appendHtmlEmbedWS (write) and setEmbedHasScript
+  // (read fallback) so that newly-created embeds (not yet Redux-dispatched) can be
+  // referenced by their id immediately. Cap LRU 200 + TTL 30 min pour éviter les
+  // memory leaks en sessions longues. Key = embedId, value = {value, hasScript,
+  // parentId, createdAt, updatedAt}.
+  // Note v2.0.0 : updateEmbedViaUI ne consomme PAS ce registry — elle lit l'état
+  // post-Save depuis Redux via getEmbedContent.
   if (!p._internal.embedsRegistry) p._internal.embedsRegistry = {};
   p._internal.embedsRegistryCap = 200;
   p._internal.embedsRegistryTtlMs = 30 * 60 * 1000;
@@ -763,248 +769,13 @@
   };
 
   /**
-   * Write content to an existing HtmlEmbed via WebSocket `siteData:update`.
-   *
-   * Algorithm (reverse-engineered from the UI save), in exact order :
-   *   1. embed.meta.html (Text, oldValue → newValue)
-   *   2. embed.meta.script (Boolean) — inserted between 1 and 3 only when scriptFlagChanged
-   *   3. content.Distinct (Text, oldValue → "") — REQUIRED even when Redux says
-   *      the content is not "compiled". Without this diff, the server ACKs success
-   *      but ignores the mutation (100% reproducible silent reject).
-   *   4. value (Text, oldValue → newValue)
-   *
-   * @param {object} args
-   * @param {string} args.embedId
-   * @param {string} args.content
-   * @param {string}  [args.forceOldValue]      Override the oldValue read from Redux
-   *   when local Redux drifted from the server (e.g. after a previous push that did
-   *   not dispatch Redux).
-   * @param {boolean} [args.forceOldHasScript]  Override the script flag read from Redux.
-   * @returns {Promise<object>} `{ ok, serverConfirmed, id, messageId, oldLength, newLength,
-   *   diffCount, scriptFlagChanged, wasCompiled, sourceOldValue, durationMs }` on success ;
-   *   `{ ok: false, error, ... }` otherwise.
-   *
-   * @see docs/lessons/webflow-mcp.md §updateembed-v87-fix
-   */
-  p._localCmd.updateEmbed = function(args) {
-    var embedId = args.embedId;
-    var content = args.content;
-    var forceOldValue = args.forceOldValue;
-    var forceOldHasScript = args.forceOldHasScript;
-
-    if (!embedId) return Promise.resolve({ ok: false, error: 'embedId required' });
-    if (typeof content !== 'string') return Promise.resolve({ ok: false, error: 'content (string) required' });
-    if (content.length > 50000) {
-      return Promise.resolve({ ok: false, error: 'Content exceeds 50,000 character limit (' + content.length + ' chars)' });
-    }
-
-    // Registry fallback when the node is not in Redux. appendHtmlEmbedWS populates
-    // _internal.embedsRegistry after creation so updateEmbed works immediately
-    // without waiting for a Redux dispatch (which never comes after a WS create).
-    var root = getRoot();
-    var node = helpers.findNodeByIdInTree(root, embedId, { maxDepth: 30 });
-    var registry = (p._internal && p._internal.embedsRegistry) || {};
-    var cached = registry[embedId];
-
-    var oldValue, oldLength, oldHasScript, wasCompiled, sourceRedux;
-    if (node) {
-      if (node.get('type') !== 'HtmlEmbed') return Promise.resolve({ ok: false, error: 'Node is not an HtmlEmbed: ' + node.get('type') });
-      var data = node.get('data');
-      var actualOld = data ? (data.get('value') || '') : '';
-      oldValue = typeof forceOldValue === 'string' ? forceOldValue : actualOld;
-      oldHasScript = typeof forceOldHasScript === 'boolean' ? forceOldHasScript : readMetaScript(node);
-      wasCompiled = readHasCompiledDistinct(node);
-      sourceRedux = 'redux';
-    } else if (cached) {
-      // Node not in Redux but we have a trace in the registry.
-      oldValue = typeof forceOldValue === 'string' ? forceOldValue : (cached.value || '');
-      oldHasScript = typeof forceOldHasScript === 'boolean' ? forceOldHasScript : !!cached.hasScript;
-      wasCompiled = false; // best-effort; the content.Distinct diff is always sent anyway
-      sourceRedux = 'registry';
-    } else if (typeof forceOldValue === 'string') {
-      // Last resort: caller provides oldValue explicitly.
-      oldValue = forceOldValue;
-      oldHasScript = typeof forceOldHasScript === 'boolean' ? forceOldHasScript : false;
-      wasCompiled = false;
-      sourceRedux = 'forced';
-    } else {
-      return Promise.resolve({ ok: false, error: 'Node not found in Redux nor in registry: ' + embedId + ' (passez forceOldValue si embed externe)' });
-    }
-    oldLength = oldValue.length;
-    var newHasScript = detectScript(content);
-    var scriptFlagChanged = oldHasScript !== newHasScript;
-
-    // Skip if nothing to do (uses resolved oldValue, not actualOld).
-    if (oldValue === content && !scriptFlagChanged) {
-      return Promise.resolve({ ok: true, id: embedId, oldLength: oldLength, newLength: content.length, match: true, skipped: true });
-    }
-
-    // Socket + pageId + localeId
-    var mp = store.stores ? store.stores.MultiplayerStore : null;
-    var socket = mp && mp.state ? mp.state.socket : null;
-    if (!socket || !socket.send) {
-      return Promise.resolve({ ok: false, error: 'MultiplayerStore socket not available' });
-    }
-
-    var state = store.getState();
-    var pageId = null;
-    var pageStore = state.PageStore;
-    if (pageStore && pageStore.get) pageId = pageStore.get('id') || null;
-    if (!pageId && state.SiteDataStore) pageId = state.SiteDataStore.pageId || null;
-    if (!pageId) return Promise.resolve({ ok: false, error: 'Cannot resolve pageId' });
-
-    var localeId = null;
-    var localizationStore = store.stores.LocalizationStore;
-    if (localizationStore && localizationStore.state) {
-      var current = localizationStore.state.currentLocale;
-      var primary = localizationStore.state.primaryLocale;
-      localeId = (current && current._id) || (primary && primary._id) || null;
-    }
-
-    // Consume messageId (advances the counter as the UI does).
-    var messageId;
-    try { messageId = consumeMessageId(); }
-    catch (e) { return Promise.resolve({ ok: false, error: 'Cannot consume messageId: ' + e.message }); }
-
-    // Build expressionDiff in the exact order captured from the UI save:
-    //   1. embed.meta.html
-    //   2. embed.meta.script (if scriptFlagChanged)
-    //   3. content.Distinct → "" (ALWAYS — without this diff the server
-    //      ACKs but does not apply, 100% silent reject)
-    //   4. value
-    var expressionDiff = [];
-    expressionDiff.push({
-      type: 'update',
-      path: [{ in: 'Record', at: 'embed' }, { in: 'Record', at: 'meta' }, { in: 'Record', at: 'html' }],
-      oldValue: helpers.wrap.text(oldValue),
-      newValue: helpers.wrap.text(content),
-      elementId: embedId
-    });
-    if (scriptFlagChanged) {
-      expressionDiff.push({
-        type: 'update',
-        path: [{ in: 'Record', at: 'embed' }, { in: 'Record', at: 'meta' }, { in: 'Record', at: 'script' }],
-        oldValue: helpers.wrap.boolean(oldHasScript),
-        newValue: helpers.wrap.boolean(newHasScript),
-        elementId: embedId
-      });
-    }
-    expressionDiff.push({
-      type: 'update',
-      path: [{ in: 'Record', at: 'content' }, { in: 'Distinct' }],
-      oldValue: helpers.wrap.text(oldValue),
-      newValue: helpers.wrap.text(''),
-      elementId: embedId
-    });
-    expressionDiff.push({
-      type: 'update',
-      path: [{ in: 'Record', at: 'value' }],
-      oldValue: helpers.wrap.text(oldValue),
-      newValue: helpers.wrap.text(content),
-      elementId: embedId
-    });
-
-    var wsMessage = {
-      type: 'siteData:update',
-      payload: {
-        messageId: messageId,
-        pageId: pageId,
-        localeId: localeId,
-        actionType: 'HTML_EMBED_TEXT_SAVED',
-        operations: {
-          components: [{
-            type: 'expressionChanged',
-            componentName: ['__SitePlugin', 'page'],
-            expressionDiff: expressionDiff
-          }]
-        }
-      }
-    };
-
-    // Register ACK handler via singleton dispatcher, then fire-and-forget send.
-    // socket.send returns a Promise that rejects with "Cannot read properties
-    // of undefined (reading slice)" for some payloads — we ignore it.
-    return new Promise(function(resolve) {
-      var dispatcher;
-      try { dispatcher = getAckDispatcher(); }
-      catch (e) { return resolve({ ok: false, error: 'Dispatcher init failed: ' + e.message }); }
-
-      var t0 = Date.now();
-      var timeout = setTimeout(function() {
-        if (dispatcher.handlers[messageId]) {
-          delete dispatcher.handlers[messageId];
-          resolve({
-            ok: false,
-            error: 'Timeout 10s (no server ACK)',
-            messageId: messageId,
-            diffCount: expressionDiff.length,
-            scriptFlagChanged: scriptFlagChanged,
-            wasCompiled: wasCompiled
-          });
-        }
-      }, 10000);
-
-      dispatcher.handlers[messageId] = {
-        onSuccess: function(_d) {
-          clearTimeout(timeout);
-          // Sync internal registry for future updates (LRU+TTL purge applied).
-          try {
-            var existing = p._internal.embedsRegistry[embedId] || {};
-            p._internal.embedsRegistrySet(embedId, {
-              value: content,
-              hasScript: newHasScript,
-              parentId: existing.parentId,
-              createdAt: existing.createdAt || Date.now(),
-              updatedAt: Date.now()
-            });
-          } catch (e) { console.warn('[CodeEmbed] registry sync skip:', e.message); }
-          resolve({
-            ok: true,
-            serverConfirmed: true,
-            id: embedId,
-            messageId: messageId,
-            oldLength: oldLength,
-            newLength: content.length,
-            diffCount: expressionDiff.length,
-            scriptFlagChanged: scriptFlagChanged,
-            wasCompiled: wasCompiled,
-            sourceOldValue: sourceRedux,
-            durationMs: Date.now() - t0
-          });
-        },
-        onError: function(d) {
-          clearTimeout(timeout);
-          resolve({
-            ok: false,
-            serverRejected: true,
-            messageId: messageId,
-            error: (d && d.error && d.error.message) || 'server error',
-            full: d
-          });
-        }
-      };
-
-      try {
-        var sendResult = socket.send([wsMessage]);
-        // Ignore rejected Promise (timeout wrapper bug for some payloads).
-        if (sendResult && typeof sendResult.then === 'function') {
-          sendResult.catch(function() {});
-        } else if (Array.isArray(sendResult)) {
-          sendResult.forEach(function(r) { if (r && r.catch) r.catch(function() {}); });
-        }
-      } catch (e) {
-        // Synchronous throw — clean up handler + reject.
-        delete dispatcher.handlers[messageId];
-        clearTimeout(timeout);
-        resolve({ ok: false, error: 'socket.send threw: ' + e.message, messageId: messageId });
-      }
-    });
-  };
-
-  /**
    * Retroactively fix the `meta.script` flag on an existing HtmlEmbed (controls the
-   * `w-script` class added at render time). Same mechanism as updateEmbed (singleton
-   * dispatcher + consumeMessageId).
+   * `w-script` class added at render time). Uses the singleton WebSocket dispatcher
+   * + consumeMessageId pattern.
+   *
+   * NOTE v2.0.0 (s547) : may be subject to the same Webflow `siteData:update` spec
+   * drift that broke `updateEmbed` (cf header BREAKING note). À retester empiriquement
+   * avant usage en prod.
    *
    * @param {object} args
    * @param {string}  args.embedId
@@ -1300,7 +1071,7 @@
     };
   };
 
-  console.log('[CodeEmbed] 5 commands registered: listEmbeds, getEmbedContent, updateEmbed, updateEmbedViaUI, setEmbedHasScript.');
+  console.log('[CodeEmbed] 4 commands registered: listEmbeds, getEmbedContent, updateEmbedViaUI, setEmbedHasScript.');
 })();
 
 /**
@@ -2673,17 +2444,16 @@
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
 // only the 7 whitelisted cmds are callable via `__webflowHelper.run(name)`.
 //
-// Whitelisted cmds (10):
+// Whitelisted cmds (9):
 // 1. switchPage - MCP de_page_tool.switch_page 70% timeout
 // 2. launchBridgeApp - not in MCP
 // 3. appendHtmlEmbedWS - MCP gap (HtmlEmbed creation)
-// 4. updateEmbed - MCP gap (embed content update via raw WS — legacy)
-// 5. updateEmbedViaUI - MCP gap (embed content update via UI automation — resilient v1.7.0)
-// 6. listEmbeds - MCP gap (embed list + contents)
-// 7. getEmbedContent - MCP gap (single embed content read)
-// 8. setEmbedHasScript - MCP gap (w-script flag)
-// 9. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
-// 10. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+// 4. updateEmbedViaUI - MCP gap (embed content update via UI automation — v2.0.0 remplace updateEmbed obsolète)
+// 5. listEmbeds - MCP gap (embed list + contents)
+// 6. getEmbedContent - MCP gap (single embed content read)
+// 7. setEmbedHasScript - MCP gap (w-script flag)
+// 8. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
+// 9. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
 //
 // Bypass: `window.__webflowHelper._localCmd.X(args)` is still callable for
 // debugging or one-off direct access (manual audit trail). The wrapper only
@@ -2700,7 +2470,6 @@
     'switchPage',
     'launchBridgeApp',
     'appendHtmlEmbedWS',
-    'updateEmbed',
     'updateEmbedViaUI',
     'listEmbeds',
     'getEmbedContent',
