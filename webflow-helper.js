@@ -1,4 +1,4 @@
-/* Webflow Helper v3.5.0 - 2026-05-11 */
+/* Webflow Helper v3.5.1 - 2026-05-11 */
 
 /**
  * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
@@ -58,7 +58,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.5.0';
+  var VERSION = '3.5.1';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2180,14 +2180,20 @@
       var selectorBtn = wrapper.querySelector('[data-automation-id="page-selector-button"]');
       if (!selectorBtn) return 'page-selector-button_not_found dans wrapper';
       selectorBtn.click();
-      await new Promise(function(r) { setTimeout(r, 400); });
 
-      // 3a. Click sur l'option {pageSlug}-page dans le popover
-      var pageOption = document.querySelector('[data-automation-id="' + spec.pageSlug + '-page"]');
+      // 3a. Polling jusqu'à 2s pour que le popover affiche l'option (timing peut varier
+      // selon la taille du store + re-render React). v3.5.1 patch.
+      var pageOption = null;
+      var attempts = 0;
+      while (!pageOption && attempts < 14) {
+        await new Promise(function(r) { setTimeout(r, 150); });
+        pageOption = document.querySelector('[data-automation-id="' + spec.pageSlug + '-page"]');
+        attempts++;
+      }
       if (!pageOption) {
         // Fermer le popover ouvert avant retour erreur
         document.body.click();
-        return 'page_option_not_found: [data-automation-id="' + spec.pageSlug + '-page"] — vérifier le slug (slug Webflow lowercase avec tirets, ex: "plateaux-repas" pas "Plateaux Repas")';
+        return 'page_option_not_found après ' + (attempts * 150) + 'ms: [data-automation-id="' + spec.pageSlug + '-page"] — vérifier le slug exact du popover (ex: "contact", "plateau-repas", "bar-à-salades" — peut différer du slug retourné par data_pages_tool.list_pages, et préserve les accents Français)';
       }
       pageOption.click();
       await new Promise(function(r) { setTimeout(r, 300); });
