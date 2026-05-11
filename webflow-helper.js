@@ -1,37 +1,39 @@
-/* Webflow Helper v2.0.0 - 2026-05-11 */
+/* Webflow Helper v3.0.0 - 2026-05-11 */
 
 /**
- * Webflow Helper — minimal surface, exposes 9 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 8 cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
- * 3. appendHtmlEmbedWS — create a native HtmlEmbed (no MCP tool covers this)
- * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click) · resilient à la spec drift WebSocket
+ * 3. appendHtmlEmbedViaUI — create a HtmlEmbed via UI automation (Add panel + paste + Save)
+ * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click)
  * 5. listEmbeds — list embeds + their contents (no MCP tool)
  * 6. getEmbedContent — read a single embed's content (no MCP tool)
- * 7. setEmbedHasScript — set the w-script flag retroactively (no MCP tool)
- * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
- * 9. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ * 7. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 8. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
  *
- * BREAKING v2.0.0 (s547) : removed `updateEmbed` (raw WebSocket dispatch). Webflow
- * a changé la spec `siteData:update` (`expressionDiff` remplace `diffs` · format Immutable
- * path) — la cmd legacy retournait `[Conflict] component map`. Remplacée par
- * `updateEmbedViaUI` qui orchestre l'UI (CodeMirror paste + Save click) — résilient aux
- * futurs changements server-side.
+ * BREAKING v3.0.0 (s547) : removed `appendHtmlEmbedWS` (silent reject empirique :
+ * server ACK received but embed not in AbstractNodeStore after 5000ms) et `setEmbedHasScript`
+ * ([Conflict] component map empirique + redondant — Webflow auto-pose le flag w-script au Save UI
+ * quand le content contient `<script>`). Toutes les cmds WebSocket directes `siteData:update`
+ * migrées vers UI automation — résilient à la spec drift upstream Webflow.
+ *
+ * BREAKING v2.0.0 (s547) : removed `updateEmbed` (raw WebSocket dispatch) → `updateEmbedViaUI`.
  *
  * Any other cmd called via `__webflowHelper.run('X')` returns
  * `{ ok: false, error: 'CMD_NOT_EXPOSED' }`. Everything else uses the official MCP server.
  *
  * Source: extracted from a Webflow Designer "deck" toolkit (full bundle archived
  * at `tools/_archive/webflow-deck-v9.6.0.js`). Modules retained:
- * Bridge init + run() + write queue, Core Helpers (Redux+DOM), CodeEmbed,
- * appendHtmlEmbedWS, switchPage, launchBridgeApp helpers, whitelist filter.
+ * Bridge init + run() + write queue, Core Helpers (Redux+DOM), CodeEmbed (incl. UI
+ * automation cmds appendHtmlEmbedViaUI / updateEmbedViaUI v3.0.0), switchPage,
+ * launchBridgeApp helpers, whitelist filter.
  */
 
 (function() {
   'use strict';
 
-  var VERSION = '2.0.0';
+  var VERSION = '3.0.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -63,9 +65,8 @@
   // WRITE cmds - routed through FIFO queue with throttle to avoid multiplayer
   // version-vector conflicts. Reads bypass the queue.
   var WRITE_COMMANDS = {
-    appendHtmlEmbedWS: true,
+    appendHtmlEmbedViaUI: true,
     updateEmbedViaUI: true,
-    setEmbedHasScript: true,
     switchPage: true
   };
 
@@ -464,7 +465,7 @@
 /**
  * CodeEmbed — HtmlEmbed read/write via Redux + WebSocket.
  *
- * Cmds: listEmbeds, getEmbedContent, updateEmbedViaUI, setEmbedHasScript.
+ * Cmds: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI.
  *
  * Persistence (UI save reverse-engineered): socket message `siteData:update` with
  * - actionType=HTML_EMBED_TEXT_SAVED
@@ -490,19 +491,18 @@
   if (!p._localCmd) p._localCmd = {};
 
   // Expose `consumeMessageId` and `getAckDispatcher` on `_internal` BEFORE the
-  // core-helpers check below so the appendHtmlEmbedWS module (later in this file)
-  // gets them even if core-helpers fails to load (degraded environment).
+  // core-helpers check below (legacy compat — historiquement utilisé par le module
+  // appendHtmlEmbedWS retiré v3.0.0 · conservé au cas où un consommateur externe
+  // accède à `_internal` directement).
   // Functions are hoisted and depend only on `store` (validated above).
   p._internal = p._internal || {};
   p._internal.consumeMessageId = consumeMessageId;
   p._internal.getAckDispatcher = getAckDispatcher;
-  // embedsRegistry — shared between appendHtmlEmbedWS (write) and setEmbedHasScript
-  // (read fallback) so that newly-created embeds (not yet Redux-dispatched) can be
-  // referenced by their id immediately. Cap LRU 200 + TTL 30 min pour éviter les
-  // memory leaks en sessions longues. Key = embedId, value = {value, hasScript,
-  // parentId, createdAt, updatedAt}.
-  // Note v2.0.0 : updateEmbedViaUI ne consomme PAS ce registry — elle lit l'état
-  // post-Save depuis Redux via getEmbedContent.
+  // embedsRegistry — était utilisé par appendHtmlEmbedWS + setEmbedHasScript (cmds
+  // raw WebSocket retirées v3.0.0). Conservé pour compat éventuelle mais inutilisé
+  // par les cmds UI automation actuelles (appendHtmlEmbedViaUI / updateEmbedViaUI)
+  // qui lisent l'état post-Save depuis Redux via getEmbedContent. À retirer en v4.0.0
+  // si aucun consommateur n'apparaît.
   if (!p._internal.embedsRegistry) p._internal.embedsRegistry = {};
   p._internal.embedsRegistryCap = 200;
   p._internal.embedsRegistryTtlMs = 30 * 60 * 1000;
@@ -551,8 +551,8 @@
   // HELPERS — delegated to __webflowHelper._internal.helpers (core-helpers.js )
   // ============================================================
 
-  // Validate core-helpers loaded — commands below disabled if absent, but
-  // _internal helpers above stay exposed for the appendHtmlEmbedWS module below.
+  // Validate core-helpers loaded — commands below disabled if absent. Le module
+  // appendHtmlEmbedWS (qui consommait _internal helpers) a été retiré v3.0.0.
   var helpers = p._internal && p._internal.helpers;
   var errors = helpers.errors;
   if (!helpers) {
@@ -769,140 +769,6 @@
   };
 
   /**
-   * Retroactively fix the `meta.script` flag on an existing HtmlEmbed (controls the
-   * `w-script` class added at render time). Uses the singleton WebSocket dispatcher
-   * + consumeMessageId pattern.
-   *
-   * NOTE v2.0.0 (s547) : may be subject to the same Webflow `siteData:update` spec
-   * drift that broke `updateEmbed` (cf header BREAKING note). À retester empiriquement
-   * avant usage en prod.
-   *
-   * @param {object} args
-   * @param {string}  args.embedId
-   * @param {boolean} [args.hasScript]          Target value. If undefined, auto-detected
-   *   from the embed's current content.
-   * @param {boolean} [args.forceOldHasScript]  Override the flag read from Redux for
-   *   comparison. Useful when local Redux drifted from the server (e.g. after a previous
-   *   push that did not dispatch Redux).
-   * @returns {Promise<object>} `{ ok, serverConfirmed, id, messageId, oldHasScript,
-   *   newHasScript, autoDetected }` on success ; `{ ok: false, error, ... }` otherwise.
-   */
-  p._localCmd.setEmbedHasScript = function(args) {
-    var embedId = args.embedId;
-    var forcedValue = args.hasScript;
-    var forceOldHasScript = args.forceOldHasScript;
-
-    if (!embedId) return Promise.resolve({ ok: false, error: 'embedId required' });
-
-    var root = getRoot();
-    var node = helpers.findNodeByIdInTree(root, embedId, { maxDepth: 30 });
-    if (!node) return Promise.resolve({ ok: false, error: 'Node not found: ' + embedId });
-    if (node.get('type') !== 'HtmlEmbed') return Promise.resolve({ ok: false, error: 'Node is not an HtmlEmbed: ' + node.get('type') });
-
-    var data = node.get('data');
-    var content = data ? (data.get('value') || '') : '';
-    var oldHasScript = typeof forceOldHasScript === 'boolean' ? forceOldHasScript : readMetaScript(node);
-    var newHasScript = (typeof forcedValue === 'boolean') ? forcedValue : detectScript(content);
-
-    if (oldHasScript === newHasScript) {
-      return Promise.resolve({ ok: true, id: embedId, hasScript: newHasScript, skipped: true, reason: 'already set' });
-    }
-
-    var mp = store.stores ? store.stores.MultiplayerStore : null;
-    var socket = mp && mp.state ? mp.state.socket : null;
-    if (!socket || !socket.send) return Promise.resolve({ ok: false, error: 'Socket not available' });
-
-    var state = store.getState();
-    var pageId = null;
-    var pageStore = state.PageStore;
-    if (pageStore && pageStore.get) pageId = pageStore.get('id') || null;
-    if (!pageId && state.SiteDataStore) pageId = state.SiteDataStore.pageId || null;
-    if (!pageId) return Promise.resolve({ ok: false, error: 'Cannot resolve pageId' });
-
-    var localeId = null;
-    var localizationStore = store.stores.LocalizationStore;
-    if (localizationStore && localizationStore.state) {
-      var current = localizationStore.state.currentLocale;
-      var primary = localizationStore.state.primaryLocale;
-      localeId = (current && current._id) || (primary && primary._id) || null;
-    }
-
-    var messageId;
-    try { messageId = consumeMessageId(); }
-    catch (e) { return Promise.resolve({ ok: false, error: 'Cannot consume messageId: ' + e.message }); }
-
-    var wsMessage = {
-      type: 'siteData:update',
-      payload: {
-        messageId: messageId,
-        pageId: pageId,
-        localeId: localeId,
-        actionType: 'HTML_EMBED_TEXT_SAVED',
-        operations: {
-          components: [{
-            type: 'expressionChanged',
-            componentName: ['__SitePlugin', 'page'],
-            expressionDiff: [{
-              type: 'update',
-              path: [{ in: 'Record', at: 'embed' }, { in: 'Record', at: 'meta' }, { in: 'Record', at: 'script' }],
-              oldValue: helpers.wrap.boolean(oldHasScript),
-              newValue: helpers.wrap.boolean(newHasScript),
-              elementId: embedId
-            }]
-          }]
-        }
-      }
-    };
-
-    return new Promise(function(resolve) {
-      var dispatcher;
-      try { dispatcher = getAckDispatcher(); }
-      catch (e) { return resolve({ ok: false, error: 'Dispatcher init failed: ' + e.message }); }
-
-      var timeout = setTimeout(function() {
-        if (dispatcher.handlers[messageId]) {
-          delete dispatcher.handlers[messageId];
-          resolve({ ok: false, error: 'Timeout 10s', messageId: messageId });
-        }
-      }, 10000);
-
-      dispatcher.handlers[messageId] = {
-        onSuccess: function() {
-          clearTimeout(timeout);
-          resolve({
-            ok: true,
-            serverConfirmed: true,
-            id: embedId,
-            messageId: messageId,
-            oldHasScript: oldHasScript,
-            newHasScript: newHasScript,
-            autoDetected: (typeof forcedValue !== 'boolean')
-          });
-        },
-        onError: function(d) {
-          clearTimeout(timeout);
-          resolve({
-            ok: false,
-            serverRejected: true,
-            messageId: messageId,
-            error: (d && d.error && d.error.message) || 'server error'
-          });
-        }
-      };
-
-      try {
-        var sendResult = socket.send([wsMessage]);
-        if (sendResult && typeof sendResult.then === 'function') sendResult.catch(function() {});
-        else if (Array.isArray(sendResult)) sendResult.forEach(function(r) { if (r && r.catch) r.catch(function() {}); });
-      } catch (e) {
-        delete dispatcher.handlers[messageId];
-        clearTimeout(timeout);
-        resolve({ ok: false, error: 'socket.send threw: ' + e.message });
-      }
-    });
-  };
-
-  /**
    * Update an HtmlEmbed via UI automation — alternative to `updateEmbed`
    * resilient to Webflow's WebSocket spec drift.
    *
@@ -1071,422 +937,150 @@
     };
   };
 
-  console.log('[CodeEmbed] 4 commands registered: listEmbeds, getEmbedContent, updateEmbedViaUI, setEmbedHasScript.');
-})();
-
-/**
- * appendHtmlEmbedWS — create a native Webflow HtmlEmbed via direct WebSocket.
- *
- * Same WS mechanism (`siteData:update`) as appendElementWS but with the exact
- * structure of a HtmlEmbed (type ["Embed", "HtmlEmbed"] + Distinct CodeProp +
- * Union keepInHtml). 11 fields in `data.val` are commented inline at the build site.
- *
- * @see docs/lessons/webflow-mcp.md §htmlembed-creation-ws — gotchas + silent-reject anti-patterns
- * @see docs/lessons/webflow-mcp.md §htmlembed-w-script-flag — w-script fix
- */
-
-(function() {
-  'use strict';
-
-  // Consume _internal.helpers for stack consistency (instead of re-implementing
-  // getSocket / getPageInfo locally).
-  var helpers = window.__webflowHelper && window.__webflowHelper._internal && window.__webflowHelper._internal.helpers;
-  if (!helpers) {
-    console.log('[appendHtmlEmbedWS] _internal.helpers not loaded — module skipped');
-    return;
-  }
-
-  // Silent-reject recovery registry: tracks embeds that returned
-  // ackedButNotPersisted: true so that if the server commits them tardively (after
-  // the 5s poll timeout), a retry with same (parentId, content) returns the
-  // late-persisted embedId instead of creating a duplicate. TTL 30s.
-  var SILENT_REJECT_REGISTRY = [];
-
-  function silentRejectRegistryFind(parentId, content) {
-    var now = Date.now();
-    // Clean up entries older than 30s (in-place reverse iteration).
-    for (var i = SILENT_REJECT_REGISTRY.length - 1; i >= 0; i--) {
-      if (now - SILENT_REJECT_REGISTRY[i].timeoutAt > 30000) {
-        SILENT_REJECT_REGISTRY.splice(i, 1);
-      }
-    }
-    // Look up matching entry.
-    for (var j = 0; j < SILENT_REJECT_REGISTRY.length; j++) {
-      var e = SILENT_REJECT_REGISTRY[j];
-      if (e.parentId === parentId && e.content === content) return { entry: e, index: j };
-    }
-    return null;
-  }
-
-  // Expose for tests / debug.
-  if (window.__webflowHelper && window.__webflowHelper._internal) {
-    window.__webflowHelper._internal.silentRejectRegistry = SILENT_REJECT_REGISTRY;
-  }
-
-  var uuid = helpers.uuid;
-
-  function getSocket() {
-    var stores = helpers.getStores();
-    return (stores.MultiplayerStore && stores.MultiplayerStore.state && stores.MultiplayerStore.state.socket) || null;
-  }
-
-  function getPageInfo() {
-    var stores = helpers.getStores();
-    var siteData = stores.SiteDataStore && stores.SiteDataStore.state;
-    var loc = stores.LocalizationStore && stores.LocalizationStore.state;
-    if (!siteData) return null;
-    return {
-      pageId: siteData.pageId,
-      siteId: siteData.siteId,
-      localeId: (loc && loc.currentLocale && loc.currentLocale._id) || (loc && loc.primaryLocale && loc.primaryLocale._id) || null
-    };
-  }
-
-  // Detect presence of a <script> tag in the HTML content. Webflow sets this
-  // in data.embed.meta.script at UI parse time and uses it to add the `w-script`
-  // class at render. Without this flag, Webflow silently strips <script> at publish.
-  function detectScript(content) {
-    return /<script[\s>]/i.test(content);
-  }
-
   /**
-   * Create a native Webflow HtmlEmbed.
-   * @param {{parentId: string, content?: string, index?: number}} options
-   * @returns {Promise<{ok: boolean, embedId?: string, messageId?: string, error?: string}>}
+   * Create a new HtmlEmbed via UI automation (Add panel + Code Editor paste + Save).
+   *
+   * Webflow workflow auto-orchestré (7 steps · ~5-8s) :
+   *   1. Deselect (canvas body.click)
+   *   2. Click parent in canvas (data-w-id) → sélection parent
+   *   3. Open Add panel if not already open (data-automation-id="left-sidebar-add-button")
+   *   4. Click HtmlEmbed component (data-automation-id="add-tab-HtmlEmbed")
+   *      → embed créé AUTO + modal Code Editor ouvert AUTO + nouvel embed sélectionné
+   *   5. Capture new embedId via selectedNodeNativeId
+   *   6. Paste content via .cm-content + ClipboardEvent
+   *   7. Click "Save & Close"
+   *   8. Validate via getEmbedContent
+   *
+   * Le flag `w-script` est auto-posé par Webflow au Save UI quand le content contient
+   * `<script>` (validé empirique s547) — pas besoin d'appel setEmbedHasScript séparé.
+   *
+   * @param {object} args
+   * @param {string} args.parentId               id du parent (canvas data-w-id ou native id Webflow)
+   * @param {string} args.content                content HTML à coller dans le nouvel embed
+   * @param {object} [args.waitMs]               override per-step delays (afterDeselect, afterSelectParent, afterOpenAddPanel, afterClickEmbed, afterPaste, afterSave)
+   * @returns {Promise<object>} `{ ok, success, embedId, parentId, expectedLength, actualLength, delta, durationMs, error? }`
+   *
+   * @see docs/lessons/webflow-helper-canon.md §appendhtmlembedviaui
    */
-  function appendHtmlEmbedWS(options) {
-    options = options || {};
-    var parentId = options.parentId;
-    var content = typeof options.content === 'string' ? options.content : '';
-    var index = typeof options.index === 'number' ? options.index : 0;
-    var hasScript = detectScript(content);
+  p._localCmd.appendHtmlEmbedViaUI = async function(args) {
+    args = args || {};
+    var parentId = args.parentId;
+    var content = args.content;
+    var waitMs = args.waitMs || {};
 
-    return new Promise(function(resolve) {
-      // Reject client-side: comment-only / whitespace content is silent-rejected
-      // by Webflow. Strip HTML comments + trim — if empty, return error immediately
-      // instead of waiting 5s for the Redux poll timeout.
-      var stripped = (content || '').replace(/<!--[\s\S]*?-->/g, '').trim();
-      if (!stripped) {
-        return resolve({
-          ok: false,
-          error: 'Webflow silent-rejects embeds with empty or comment-only content. Use substantive HTML: <div>, <style>, <script> with content. For invisible markers: <div style="display:none">marker</div>',
-          embedId: null,
-          contentRejectedClientSide: true
-        });
-      }
+    if (!parentId) return { ok: false, error: 'parentId required' };
+    if (typeof content !== 'string') return { ok: false, error: 'content (string) required' };
 
-      if (!parentId) {
-        return resolve({ ok: false, error: 'parentId required (ID of an existing element)' });
-      }
+    var DELAYS = {
+      afterDeselect: waitMs.afterDeselect || 250,
+      afterSelectParent: waitMs.afterSelectParent || 500,
+      afterOpenAddPanel: waitMs.afterOpenAddPanel || 500,
+      afterClickEmbed: waitMs.afterClickEmbed || 800,
+      afterPaste: waitMs.afterPaste || 400,
+      afterSave: waitMs.afterSave || 3000
+    };
 
-      // Idempotency check: if a silent-reject is pending for this (parentId, content)
-      // and it has now been persisted tardively, return that embedId (no retry, no duplicate).
-      var pending = silentRejectRegistryFind(parentId, content);
-      if (pending) {
-        var late = false;
-        try { late = helpers.findNodeById(pending.entry.embedId) != null; } catch (e) {}
-        if (late) {
-          // Late-persisted — return idempotent (LRU+TTL purge applied).
-          try {
-            var setFn = window.__webflowHelper._internal.embedsRegistrySet;
-            if (typeof setFn === 'function') {
-              setFn(pending.entry.embedId, {
-                value: content,
-                hasScript: hasScript,
-                parentId: parentId,
-                createdAt: pending.entry.timeoutAt,
-                updatedAt: Date.now()
-              });
-            } else {
-              // Fallback if setFn unavailable (defensive — CodeEmbed module skipped).
-              window.__webflowHelper._internal.embedsRegistry = window.__webflowHelper._internal.embedsRegistry || {};
-              window.__webflowHelper._internal.embedsRegistry[pending.entry.embedId] = {
-                value: content, hasScript: hasScript, parentId: parentId,
-                createdAt: pending.entry.timeoutAt, updatedAt: Date.now()
-              };
-            }
-          } catch (e) { console.warn('[appendHtmlEmbedWS] registry sync skip:', e.message); }
-          SILENT_REJECT_REGISTRY.splice(pending.index, 1);
-          return resolve({
-            ok: true,
-            embedId: pending.entry.embedId,
-            messageId: pending.entry.messageId,
-            recoveredFromSilentRejectId: true,
-            confirmedAfterMs: Date.now() - pending.entry.timeoutAt
-          });
-        }
-        // Entry exists but embed truly absent → cleanup stale entry, proceed with normal create
-        SILENT_REJECT_REGISTRY.splice(pending.index, 1);
-      }
+    function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+    var start = Date.now();
 
-      var socket = getSocket();
-      if (!socket || !socket.send) {
-        return resolve({ ok: false, error: 'Socket not available' });
-      }
+    // 1. Locate canvas iframe
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    if (!canvas) return { ok: false, error: 'canvas iframe not found' };
+    var canvasDoc = canvas.contentDocument;
+    if (!canvasDoc) return { ok: false, error: 'canvas iframe contentDocument not accessible' };
 
-      var info = getPageInfo();
-      if (!info || !info.pageId) {
-        return resolve({ ok: false, error: 'pageId not found' });
-      }
-      if (!info.localeId) {
-        return resolve({ ok: false, error: 'localeId not found (LocalizationStore empty?)' });
-      }
+    var store = window._webflow;
+    if (!store || !store.stores || !store.stores.UiNodeStore) {
+      return { ok: false, error: 'Webflow store not accessible' };
+    }
+    var uiNode = store.stores.UiNodeStore;
 
-      // Consume messageId via shared helper (advances counter). Without this,
-      // two consecutive createEmbed calls share the same messageId and the
-      // server dedups, silently dropping the 2nd one.
-      var internal = window.__webflowHelper && window.__webflowHelper._internal;
-      var mp = window._webflow.stores.MultiplayerStore.state;
-      var messageId;
-      if (internal && typeof internal.consumeMessageId === 'function') {
-        try { messageId = internal.consumeMessageId(); }
-        catch (e) { return resolve({ ok: false, error: 'consumeMessageId failed: ' + e.message }); }
-      } else {
-        // Fallback (should not happen if the CodeEmbed module ran first).
-        messageId = mp.nextMessageId;
-      }
-      var embedId = uuid();
+    // STEP 1: Deselect (clean state)
+    canvasDoc.body.click();
+    await wait(DELAYS.afterDeselect);
 
-      // =================================================================
-      // HtmlEmbed payload — full spec reverse-engineered.
-      // =================================================================
-      // Critical rule: the Webflow server accepts malformed payloads,
-      // returning `success: true` while NOT persisting the embed (silent
-      // reject). Each field below is REQUIRED with its exact type. Always
-      // verify by reading back via listEmbeds after a Designer reload.
-      //
-      // Minimum validation: 11 fields in data.val (search, embed, insideRTE,
-      // value, content, devlink, displayName, attr, xattr, styleBlockIds,
-      // visibility).
-      var elementValue = {
-        type: 'Element',
-        val: {
-          id: embedId,
-          // ⚠️ TUPLE obligatoire ['Embed', 'HtmlEmbed'] — PAS string.
-          // `type: "HtmlEmbed"` → server returns success, embed NOT persisted.
-          // 1er = catégorie ("Embed"), 2ème = sous-type ("HtmlEmbed").
-          type: ['Embed', 'HtmlEmbed'],
-          data: {
-            type: 'Record',
-            val: {
-              // 1/ search — HtmlEmbed excluded from Webflow search by default.
-              search: { type: 'Record', val: { exclude: { type: 'Boolean', val: true } } },
+    // STEP 2: Select parent in canvas
+    var parentEl = canvasDoc.querySelector('[data-w-id="' + parentId + '"]');
+    if (!parentEl) {
+      // Try data-wf-id PATH for Component case
+      parentEl = canvasDoc.querySelector('[data-wf-id*="' + parentId + '"]');
+      if (!parentEl) return { ok: false, error: 'parent not found in canvas: ' + parentId };
+    }
+    parentEl.click();
+    await wait(DELAYS.afterSelectParent);
 
-              // 2/ embed — meta wrapper + HTML parsing flags.
-              embed: {
-                type: 'Record',
-                val: {
-                  // type 'Text' with val: 'html' — NOT Enum.
-                  // `{type: "Enum", val: "html"}` → silent reject.
-                  type: { type: 'Text', val: 'html' },
-                  meta: {
-                    type: 'Record',
-                    val: {
-                      html: { type: 'Text', val: content },
-                      div: { type: 'Boolean', val: false },
-                      // meta.script controls the `w-script` class at render time.
-                      // If content contains <script> and script=false, Webflow strips it at publish.
-                      script: { type: 'Boolean', val: hasScript },
-                      compilable: { type: 'Boolean', val: false },
-                      iframe: { type: 'Boolean', val: false }
-                    }
-                  }
-                }
-              },
-
-              // 3/ insideRTE — false for any standalone HtmlEmbed.
-              insideRTE: { type: 'Boolean', val: false },
-
-              // 4/ value — HTML content (duplicated with embed.meta.html — both required).
-              value: { type: 'Text', val: content },
-
-              // 5/ content — type 'Distinct' with name: ['Embed', 'CodeProp'].
-              // `{type: "Text", val: ""}` or omitting the field → silent reject.
-              content: {
-                type: 'Distinct',
-                val: { name: ['Embed', 'CodeProp'], value: { type: 'Text', val: content } }
-              },
-
-              // 6/ devlink — Webflow runtime placeholders (empty values OK but the structure is required).
-              devlink: {
-                type: 'Record',
-                val: {
-                  runtimeProps: { type: 'Literal', val: { name: ['Devlink', 'RuntimeProps'], value: {} } },
-                  slot: { type: 'Literal', val: { name: ['Devlink', 'Slot'], value: '' } }
-                }
-              },
-
-              // 7/ displayName — empty by default (editable later via the Designer).
-              displayName: { type: 'Text', val: '' },
-
-              // 8/ attr — optional HTML id (not the Webflow elementId, distinct).
-              attr: { type: 'Record', val: { id: { type: 'Text', val: '' } } },
-
-              // 9/ xattr — custom HTML attributes (empty list OK).
-              xattr: { type: 'List', val: [] },
-
-              // 10/ styleBlockIds — applied Webflow classes (empty list OK).
-              styleBlockIds: { type: 'List', val: [] },
-
-              // 11/ visibility — display conditions + keepInHtml.
-              visibility: {
-                type: 'Record',
-                val: {
-                  conditions: { type: 'List', val: [] },
-                  // keepInHtml is 'Union' with a tag + an empty value Record.
-                  // `{type: "Literal", val: "False"}` → silent reject.
-                  // `value: {}` (without the Record wrapper) → silent reject too.
-                  keepInHtml: {
-                    type: 'Union',
-                    val: { tag: 'False', value: { type: 'Record', val: {} } }
-                  }
-                }
-              }
-            }
-          }
-        }
+    if (uiNode.state.selectedNodeNativeId !== parentId) {
+      return {
+        ok: false,
+        error: 'parent selection failed',
+        selectedNode: uiNode.state.selectedNodeNativeId,
+        expectedNode: parentId
       };
+    }
 
-      var message = {
-        type: 'siteData:update',
-        payload: {
-          messageId: messageId,
-          pageId: info.pageId,
-          localeId: info.localeId,
-          operations: {
-            components: [{
-              type: 'expressionChanged',
-              componentName: ['__SitePlugin', 'page'],
-              expressionDiff: [{
-                type: 'add',
-                path: [
-                  { in: 'Record', at: 'children' },
-                  { in: 'List', index: index }
-                ],
-                value: elementValue,
-                elementId: parentId
-              }]
-            }]
-          },
-          actionType: 'ELEMENT_ADDED'
-        }
-      };
+    // STEP 3: Open Add panel if not already open
+    var embedComp = document.querySelector('[data-automation-id="add-tab-HtmlEmbed"]');
+    if (!embedComp) {
+      var addBtn = document.querySelector('[data-automation-id="left-sidebar-add-button"]');
+      if (!addBtn) return { ok: false, error: 'Add panel button not found' };
+      addBtn.click();
+      await wait(DELAYS.afterOpenAddPanel);
+      embedComp = document.querySelector('[data-automation-id="add-tab-HtmlEmbed"]');
+      if (!embedComp) return { ok: false, error: 'add-tab-HtmlEmbed component not visible after opening Add panel' };
+    }
 
-      // Use the singleton dispatcher set up by the CodeEmbed module above.
-      // Old per-push attach/restore of innerSocket._callbacks broke concurrent
-      // creates (2nd push's handler was wiped by 1st push's restore).
-      if (!internal || typeof internal.getAckDispatcher !== 'function') {
-        return resolve({ ok: false, error: '__webflowHelper._internal.getAckDispatcher not available (the CodeEmbed module must run before this one)' });
-      }
-      var dispatcher;
-      try { dispatcher = internal.getAckDispatcher(); }
-      catch (e) { return resolve({ ok: false, error: 'Dispatcher init failed: ' + e.message }); }
+    // STEP 4: Click HtmlEmbed component — creates embed AUTO + opens modal AUTO + selects new embed
+    embedComp.click();
+    await wait(DELAYS.afterClickEmbed);
 
-      var timeout = setTimeout(function() {
-        if (dispatcher.handlers[messageId]) {
-          delete dispatcher.handlers[messageId];
-          resolve({ ok: false, error: 'Timeout 10s (no server ACK)', messageId: messageId });
-        }
-      }, 10000);
+    // STEP 5: Capture new embedId via selection state (Webflow auto-selects the new node)
+    var newEmbedId = uiNode.state.selectedNodeNativeId;
+    if (!newEmbedId || newEmbedId === parentId) {
+      return { ok: false, error: 'no new embed selected after Add click', selectedNode: newEmbedId };
+    }
 
-      dispatcher.handlers[messageId] = {
-        onSuccess: function() {
-          clearTimeout(timeout);
-          // Post-ACK validation (silent-reject protection). The server can ACK
-          // success but not persist (witnessed: success:true but embed never
-          // appears in Redux). Polling AbstractNodeStore via findNodeById confirms
-          // the embed reached the tree before resolving.
-          //   - on success: populate registry + resolve with confirmedAfterMs
-          //   - on timeout: resolve { ok: false, ackedButNotPersisted: true } so
-          //     the caller can distinguish silent-reject from a server error.
-          var POLL_INTERVAL_MS = 200;
-          var POLL_TIMEOUT_MS = 5000;
-          var startedAt = Date.now();
+    // STEP 6: Paste content via ClipboardEvent on .cm-content
+    var cmContent = document.querySelector('.cm-content');
+    if (!cmContent) return { ok: false, error: 'CodeMirror modal did not open auto', newEmbedId: newEmbedId };
 
-          function isPersisted() {
-            try {
-              return helpers.findNodeById(embedId) != null;
-            } catch (e) { return false; }
-          }
+    cmContent.focus();
+    var sel = document.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(cmContent);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    var dt = new DataTransfer();
+    dt.setData('text/plain', content);
+    cmContent.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    await wait(DELAYS.afterPaste);
 
-          function pollAndResolve() {
-            if (isPersisted()) {
-              try {
-                var setFn = window.__webflowHelper._internal.embedsRegistrySet;
-                var entry = {
-                  value: content, hasScript: hasScript, parentId: parentId,
-                  createdAt: Date.now(), updatedAt: Date.now()
-                };
-                if (typeof setFn === 'function') {
-                  setFn(embedId, entry);
-                } else {
-                  window.__webflowHelper._internal.embedsRegistry = window.__webflowHelper._internal.embedsRegistry || {};
-                  window.__webflowHelper._internal.embedsRegistry[embedId] = entry;
-                }
-              } catch (e) { console.warn('[appendHtmlEmbedWS] registry sync skip:', e.message); }
-              return resolve({
-                ok: true,
-                embedId: embedId,
-                messageId: messageId,
-                confirmedAfterMs: Date.now() - startedAt
-              });
-            }
-            if (Date.now() - startedAt >= POLL_TIMEOUT_MS) {
-              // Register silent-reject for late-persist recovery — if the server
-              // commits this embed tardively, the next call with same (parentId, content)
-              // will return idempotently via silentRejectRegistryFind.
-              // If server commits this embed tardively, the next call with same
-              // (parentId, content) will find it via silentRejectRegistryFind and
-              // return idempotently instead of creating a duplicate.
-              SILENT_REJECT_REGISTRY.push({
-                embedId: embedId,
-                parentId: parentId,
-                content: content,
-                messageId: messageId,
-                timeoutAt: Date.now()
-              });
-              return resolve({
-                ok: false,
-                error: 'Silent reject: server ACK received but embed not in AbstractNodeStore after ' + POLL_TIMEOUT_MS + 'ms',
-                embedId: embedId,
-                messageId: messageId,
-                ackedButNotPersisted: true
-              });
-            }
-            setTimeout(pollAndResolve, POLL_INTERVAL_MS);
-          }
-
-          pollAndResolve();
-        },
-        onError: function(d) {
-          clearTimeout(timeout);
-          resolve({ ok: false, error: (d && d.error && d.error.message) || 'Server error', messageId: messageId, full: d });
-        }
-      };
-
-      try {
-        var sendResult = socket.send([message]);
-        // Ignore emitWithAck Promise reject (timeout wrapper bug for some payloads)
-        if (sendResult && typeof sendResult.then === 'function') sendResult.catch(function() {});
-        else if (Array.isArray(sendResult)) sendResult.forEach(function(r) { if (r && r.catch) r.catch(function() {}); });
-      } catch (e) {
-        delete dispatcher.handlers[messageId];
-        clearTimeout(timeout);
-        resolve({ ok: false, error: 'socket.send threw: ' + e.message, messageId: messageId });
-      }
+    // STEP 7: Click Save & Close
+    var saveCloseBtn = Array.from(document.querySelectorAll('button')).find(function(b) {
+      return (b.textContent || '').trim() === 'Save & Close';
     });
-  }
+    if (!saveCloseBtn) return { ok: false, error: 'Save & Close button not found', newEmbedId: newEmbedId };
+    saveCloseBtn.click();
+    await wait(DELAYS.afterSave);
 
-  // Expose via __webflowHelperDevkit (direct API).
-  window.__webflowHelperDevkit = window.__webflowHelperDevkit || {};
-  window.__webflowHelperDevkit.appendHtmlEmbedWS = appendHtmlEmbedWS;
+    // STEP 8: Validate via getEmbedContent
+    var verify = p._localCmd.getEmbedContent({ embedId: newEmbedId });
+    var success = !!(verify && verify.ok && verify.value === content);
 
-  // Register in __webflowHelper._localCmd (unified API via __webflowHelper.run()).
-  if (window.__webflowHelper && window.__webflowHelper._localCmd) {
-    window.__webflowHelper._localCmd.appendHtmlEmbedWS = appendHtmlEmbedWS;
-  }
+    return {
+      ok: success,
+      success: success,
+      embedId: newEmbedId,
+      parentId: parentId,
+      expectedLength: content.length,
+      actualLength: verify && verify.length,
+      delta: content.length - ((verify && verify.length) || 0),
+      durationMs: Date.now() - start,
+      error: success ? undefined : 'content verification mismatch after save (expected ' + content.length + ' chars, got ' + (verify && verify.length) + ')',
+      verify_ok: !!(verify && verify.ok)
+    };
+  };
 
-  console.log('[appendHtmlEmbedWS] loaded (shares consumeMessageId + singleton ACK dispatcher with the CodeEmbed module · silent-reject recovery active)');
+  console.log('[CodeEmbed] 4 commands registered: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI.');
 })();
 
 /**
@@ -2444,16 +2038,18 @@
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
 // only the 7 whitelisted cmds are callable via `__webflowHelper.run(name)`.
 //
-// Whitelisted cmds (9):
+// Whitelisted cmds (8):
 // 1. switchPage - MCP de_page_tool.switch_page 70% timeout
 // 2. launchBridgeApp - not in MCP
-// 3. appendHtmlEmbedWS - MCP gap (HtmlEmbed creation)
+// 3. appendHtmlEmbedViaUI - MCP gap (HtmlEmbed creation via UI automation — v3.0.0 remplace appendHtmlEmbedWS obsolète)
 // 4. updateEmbedViaUI - MCP gap (embed content update via UI automation — v2.0.0 remplace updateEmbed obsolète)
 // 5. listEmbeds - MCP gap (embed list + contents)
 // 6. getEmbedContent - MCP gap (single embed content read)
-// 7. setEmbedHasScript - MCP gap (w-script flag)
-// 8. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
-// 9. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+// 7. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
+// 8. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+//
+// NOTE v3.0.0 : setEmbedHasScript retirée (redundant — Webflow auto-pose le flag w-script
+// au Save UI quand le content contient `<script>`).
 //
 // Bypass: `window.__webflowHelper._localCmd.X(args)` is still callable for
 // debugging or one-off direct access (manual audit trail). The wrapper only
@@ -2469,11 +2065,10 @@
   var ALLOWED_CMDS = [
     'switchPage',
     'launchBridgeApp',
-    'appendHtmlEmbedWS',
+    'appendHtmlEmbedViaUI',
     'updateEmbedViaUI',
     'listEmbeds',
     'getEmbedContent',
-    'setEmbedHasScript',
     'getCurrentPageInfo',
     'dumpTree'
   ];
