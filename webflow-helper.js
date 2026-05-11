@@ -1,4 +1,4 @@
-/* Webflow Helper v3.1.0 - 2026-05-11 */
+/* Webflow Helper v3.2.0 - 2026-05-11 */
 
 /**
  * Webflow Helper — minimal surface, exposes 9 cmds via `__webflowHelper.run()`:
@@ -12,6 +12,12 @@
  * 7. getEmbedContent — read a single embed's content (no MCP tool)
  * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
  * 9. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ *
+ * CLEANUP v3.2.0 (s547) : retiré le code mort hérité des cmds raw WebSocket retirées
+ * en v2.0.0/v3.0.0 — `_internal.consumeMessageId`, `_internal.getAckDispatcher`,
+ * `_internal.embedsRegistry` (+ son LRU/TTL infrastructure), helpers internes
+ * `detectScript`/`readMetaScript`/`readHasCompiledDistinct`. Total : -204L (~9%).
+ * Pas de changement comportemental — uniquement nettoyage interne.
  *
  * BREAKING v3.0.0 (s547) : removed `appendHtmlEmbedWS` (silent reject empirique :
  * server ACK received but embed not in AbstractNodeStore after 5000ms) et `setEmbedHasScript`
@@ -34,7 +40,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.1.0';
+  var VERSION = '3.2.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -492,73 +498,14 @@
 
   if (!p._localCmd) p._localCmd = {};
 
-  // Expose `consumeMessageId` and `getAckDispatcher` on `_internal` BEFORE the
-  // core-helpers check below (legacy compat — historiquement utilisé par le module
-  // appendHtmlEmbedWS retiré v3.0.0 · conservé au cas où un consommateur externe
-  // accède à `_internal` directement).
-  // Functions are hoisted and depend only on `store` (validated above).
-  p._internal = p._internal || {};
-  p._internal.consumeMessageId = consumeMessageId;
-  p._internal.getAckDispatcher = getAckDispatcher;
-  // embedsRegistry — était utilisé par appendHtmlEmbedWS + setEmbedHasScript (cmds
-  // raw WebSocket retirées v3.0.0). Conservé pour compat éventuelle mais inutilisé
-  // par les cmds UI automation actuelles (appendHtmlEmbedViaUI / updateEmbedViaUI)
-  // qui lisent l'état post-Save depuis Redux via getEmbedContent. À retirer en v4.0.0
-  // si aucun consommateur n'apparaît.
-  if (!p._internal.embedsRegistry) p._internal.embedsRegistry = {};
-  p._internal.embedsRegistryCap = 200;
-  p._internal.embedsRegistryTtlMs = 30 * 60 * 1000;
-  p._internal.embedsRegistrySet = function(embedId, entry) {
-    // Atomic phase on snapshot to avoid TOCTOU race between concurrent set() callers.
-    // Worst case: last write wins on key collision (acceptable).
-    var registry = p._internal.embedsRegistry;
-    var cap = p._internal.embedsRegistryCap;
-    var ttl = p._internal.embedsRegistryTtlMs;
-    var now = Date.now();
-
-    // Snapshot keys before any mutation (reduces the TOCTOU window).
-    var keys = Object.keys(registry);
-    var toDelete = [];
-
-    // 1. Identify stale entries (TTL exceeded).
-    for (var i = 0; i < keys.length; i++) {
-      var k = keys[i];
-      var entry_i = registry[k];
-      if (entry_i && (now - (entry_i.updatedAt || 0)) > ttl) {
-        toDelete.push(k);
-      }
-    }
-
-    // 2. If still >= cap after stale purge, identify the oldest entry (LRU).
-    var stillRemaining = keys.length - toDelete.length;
-    if (stillRemaining >= cap) {
-      var oldestKey = null;
-      var oldestTs = Infinity;
-      for (var j = 0; j < keys.length; j++) {
-        if (toDelete.indexOf(keys[j]) !== -1) continue; // already marked for delete
-        var ts = (registry[keys[j]] && registry[keys[j]].updatedAt) || 0;
-        if (ts < oldestTs) { oldestTs = ts; oldestKey = keys[j]; }
-      }
-      if (oldestKey) toDelete.push(oldestKey);
-    }
-
-    // 3. Atomic phase: delete + set sequentially without yield.
-    for (var d = 0; d < toDelete.length; d++) {
-      delete registry[toDelete[d]];
-    }
-    registry[embedId] = entry;
-  };
-
-  // ============================================================
   // HELPERS — delegated to __webflowHelper._internal.helpers (core-helpers.js )
   // ============================================================
 
-  // Validate core-helpers loaded — commands below disabled if absent. Le module
-  // appendHtmlEmbedWS (qui consommait _internal helpers) a été retiré v3.0.0.
+  // Validate core-helpers loaded — commands below disabled if absent.
   var helpers = p._internal && p._internal.helpers;
-  var errors = helpers.errors;
+  var errors = helpers && helpers.errors;
   if (!helpers) {
-    console.log('[CodeEmbed] core-helpers not loaded — embed commands disabled (but _internal helpers exposed)');
+    console.log('[CodeEmbed] core-helpers not loaded — embed commands disabled');
     return;
   }
 
@@ -566,154 +513,8 @@
   var getRoot = helpers.getRoot;
   var getStyleBlocksJS = helpers.getStyleBlocks;  // core returns plain JS dict, not Immutable
 
-  // Detect presence of a <script> tag in the HTML content. Webflow sets
-  // data.embed.meta.script at UI parse time and uses it to add the `w-script`
-  // class at render. Without this flag, Webflow silently strips <script> at publish.
-  function detectScript(content) {
-    return /<script[\s>]/i.test(content);
-  }
 
-  // Read the current meta.script flag of an embed from Redux.
-  function readMetaScript(node) {
-    var data = node.get('data');
-    if (!data) return false;
-    var embed = data.get('embed');
-    if (!embed) return false;
-    var meta = embed.get ? embed.get('meta') : null;
-    if (!meta) return false;
-    return !!(meta.get ? meta.get('script') : meta.script);
-  }
 
-  // Reads the "compiled" flag from data.content for diagnostic purposes only.
-  // The diff content.Distinct→"" is sent unconditionally regardless of this
-  // value (UI capture showed Webflow always sends it).
-  function readHasCompiledDistinct(node) {
-    var data = node.get('data');
-    if (!data) return false;
-    var content = data.get('content');
-    if (!content) return false;
-    try {
-      var val = content.get ? content.get('value') : null;
-      if (!val) return false;
-      var innerVal = val.get ? val.get('val') : null;
-      return !!(innerVal && typeof innerVal === 'string' && innerVal.length > 0);
-    } catch (e) { return false; }
-  }
-
-  // Webflow messageId format: <4 UUID segments>-<12-char hex counter>.
-  // Example: "67a1bf38-7850-c985-9714-6cd93a1221a3" — counter is the 5th segment.
-  // The UI consumes + advances the counter before sending; we replicate exactly.
-  function consumeMessageId() {
-    var mp = store.stores && store.stores.MultiplayerStore;
-    if (!mp || !mp.state) throw new Error('MultiplayerStore not available');
-    var current = mp.state.nextMessageId;
-    if (!current || typeof current !== 'string') throw new Error('Invalid nextMessageId: ' + current);
-    var parts = current.split('-');
-    if (parts.length !== 5 || parts[4].length !== 12) {
-      throw new Error('Unexpected messageId format: ' + current);
-    }
-    var counter = parseInt(parts[4], 16);
-    if (isNaN(counter)) throw new Error('messageId counter not hex: ' + parts[4]);
-    var next = (counter + 1).toString(16);
-    while (next.length < 12) next = '0' + next;
-    var advancedId = parts.slice(0, 4).join('-') + '-' + next;
-    // Direct mutation of the Flux state (mp.state is an Immutable Record currently
-    // mutable via direct assignment in this Webflow version). If Webflow tightens
-    // the structure (strict Immutable), direct assignment becomes a silent no-op,
-    // the counter stops advancing, the messageId is reused, and the server
-    // silently rejects the second push.
-    //
-    // Verify post-mutation: if direct assignment was a silent no-op, fall back
-    // to .set() or throw.
-    try {
-      mp.state.nextMessageId = advancedId;
-    } catch (e) {
-      if (mp.state.set) { mp.state = mp.state.set('nextMessageId', advancedId); }
-      else { throw e; }
-    }
-    // Verify: if direct mutation was silently ignored (strict Immutable),
-    // mp.state.nextMessageId is still === current → fall back to .set() or throw.
-    if (mp.state.nextMessageId === current) {
-      if (mp.state.set) {
-        mp.state = mp.state.set('nextMessageId', advancedId);
-        if (mp.state.nextMessageId !== advancedId) {
-          throw new Error('messageId counter mutation was a silent no-op (strict Immutable?) — current=' + current);
-        }
-      } else {
-        throw new Error('messageId counter mutation failed (no .set fallback) — current=' + current);
-      }
-    }
-    return current;
-  }
-
-  // ACK dispatcher — singleton listener registered once per event, dispatching
-  // to per-messageId handlers via a shared map. Avoids the broken pattern of
-  // attach/restore on every push (a 2nd push's restore would wipe handlers
-  // installed by a 1st concurrent push).
-  //
-  // Invalidation on socket reconnect: if the WebSocket is replaced (reconnect,
-  // page navigation), handlers on the old socket never receive ACKs and pending
-  // pushes hang. The dispatcher memorizes the socket and resets when it changes,
-  // notifying pending handlers via onError (not silently dropped).
-  var _ackDispatcher = null;
-  var _ackDispatcherSocket = null;
-  function getAckDispatcher() {
-    var mp = store.stores && store.stores.MultiplayerStore;
-    var socket = mp && mp.state && mp.state.socket;
-    var innerSocket = socket && socket.socket;
-    if (!innerSocket || !innerSocket._callbacks) {
-      throw new Error('Inner socket or _callbacks not available');
-    }
-    // Reset if the socket has changed (reconnect / navigation)
-    if (_ackDispatcher && _ackDispatcherSocket !== innerSocket) {
-      var pending = Object.keys(_ackDispatcher.handlers);
-      console.warn('[CodeEmbed] socket changed — resetting _ackDispatcher (' +
-        pending.length + ' pending handlers, calling onError before reset)');
-      for (var i = 0; i < pending.length; i++) {
-        var msgId = pending[i];
-        var h = _ackDispatcher.handlers[msgId];
-        if (h && h.onError) {
-          try {
-            h.onError({ messageId: msgId, error: errors.SOCKET_RECONNECT_DROPPED });
-          } catch (e) {
-            console.warn('[CodeEmbed] handler.onError threw during reset:', e.message);
-          }
-        }
-        delete _ackDispatcher.handlers[msgId];
-      }
-      _ackDispatcher = null;
-      _ackDispatcherSocket = null;
-    }
-    if (_ackDispatcher) return _ackDispatcher;
-
-    _ackDispatcher = { handlers: {} };
-    _ackDispatcherSocket = innerSocket;
-
-    var onSuccess = function(d) {
-      if (!d || !d.messageId) return;
-      var h = _ackDispatcher.handlers[d.messageId];
-      if (h && h.onSuccess) {
-        delete _ackDispatcher.handlers[d.messageId];
-        h.onSuccess(d);
-      }
-    };
-    var onError = function(d) {
-      if (!d || !d.messageId) return;
-      var h = _ackDispatcher.handlers[d.messageId];
-      if (h && h.onError) {
-        delete _ackDispatcher.handlers[d.messageId];
-        h.onError(d);
-      }
-    };
-
-    // Append (do not replace) to preserve existing Webflow handlers.
-    var existingS = innerSocket._callbacks['$siteData:updateSuccess'] || [];
-    var existingE = innerSocket._callbacks['$siteData:updateError'] || [];
-    innerSocket._callbacks['$siteData:updateSuccess'] = existingS.concat([onSuccess]);
-    innerSocket._callbacks['$siteData:updateError'] = existingE.concat([onError]);
-
-    return _ackDispatcher;
-  }
 
   // ============================================================
   // COMMANDS
