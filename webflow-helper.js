@@ -1,4 +1,4 @@
-/* Webflow Helper v3.2.0 - 2026-05-11 */
+/* Webflow Helper v3.3.0 - 2026-05-11 */
 
 /**
  * Webflow Helper — minimal surface, exposes 9 cmds via `__webflowHelper.run()`:
@@ -12,6 +12,13 @@
  * 7. getEmbedContent — read a single embed's content (no MCP tool)
  * 8. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
  * 9. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ *    + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
+ *      (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
+ *      from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.3.0 (s548) : dumpTree `expandSlotOverrides` — révèle les ComponentInstance
+ * imbriquées dans des slots avec leurs prop values (Question/Réponse/CTA Text/CTA Lien
+ * sur FAQ Items, etc.). Aligné stratégie s548 : lecture Redux OK, writes interdits.
  *
  * CLEANUP v3.2.0 (s547) : retiré le code mort hérité des cmds raw WebSocket retirées
  * en v2.0.0/v3.0.0 — `_internal.consumeMessageId`, `_internal.getAckDispatcher`,
@@ -40,7 +47,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.2.0';
+  var VERSION = '3.3.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -1607,12 +1614,81 @@
    * @param {boolean} [args.includeXattr=true] Include data.xattr (custom attributes data-*, role, aria-*) — only if non-empty
    * @param {boolean} [args.expandComponents=false] When a Symbol is found, lookup its template via data.sym.inst and walk it inline as virtual children (depth offset). Each expanded node gets `fromTemplate: <inst-id>`. Template roots (data.sym.root=true) at depth 1 of root tree are NOT skipped from main walk by default (cf hideTemplateRoots).
    * @param {boolean} [args.hideTemplateRoots=false] When expandComponents=true, set this to true to filter out the original template root nodes (depth 1 with sym.root=true) from the main output to avoid duplication. Default false (templates appear both as their root + inline under Symbol instances).
+   * @param {boolean} [args.expandSlotOverrides=false] v3.3.0 — Reveal ComponentInstance children nested in slot overrides. When a Symbol instance has `data.sym.overrides[slotPropId]` = array of nodes (typical for slots like `faq_list` in a Section FAQ component), walks those nodes as virtual children with `fromSlotOverride: true`, `slotPropId`, `slotIndex`. Extracts each child's own prop overrides into a `propOverrides: {propId: value}` map (text format `[{data:{value}}]` flattened to string; link/bool kept raw). Read-only. Result includes `slot_overrides: <count>`.
    * @param {string}  [args.rootId]            v1.6.0 — Scope walk to subtree rooted at this node ID (default: body root). Reduces payload 5-10× when working in a known subsection. Returns error if ID not found.
    * @param {boolean} [args.includeParent=false] v1.6.0 — Add `parent_id` field to each entry (computed via depth-based stack during walk). Replaces the JS-side `findIndex + walk back` pattern. Only set when not compact. Skipped on virtual nodes from expandComponents.
    * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, hint?: string, scoped_to?: string, error?: string }}
    *
    * v1.6.0 hint heuristics: when count===0, the response includes a `hint` field describing the most likely cause (low maxDepth, page not loaded, class spelling, text on non-text-bearing nodes). Empty hint = filter just doesn't match anything.
    */
+  // v3.3.0 — walker pour les slot overrides d'une Symbol instance.
+  // Webflow stocke les children d'un slot dans `data.sym.overrides[slotPropId]` =
+  // array d'objets plain JS (pas Immutable), chacun avec son propre `data.sym.overrides`
+  // pour les prop values (text format : `[{data:{value:"..."}}]`).
+  // Lecture seule — aucun write/dispatch. Aligné stratégie s548.
+  function expandSlotOverridesAt(node, parentDepth, outArr, opts) {
+    try {
+      var data = node.get && node.get('data');
+      if (!data) return 0;
+      var sym = data.get && data.get('sym');
+      if (!sym) return 0;
+      var overrides = sym.get && sym.get('overrides');
+      if (!overrides) return 0;
+      var overridesJS = overrides.toJS ? overrides.toJS() : overrides;
+      if (!overridesJS || typeof overridesJS !== 'object') return 0;
+
+      var count = 0;
+      Object.keys(overridesJS).forEach(function(propId) {
+        var val = overridesJS[propId];
+        // Heuristique slot children : array de nodes plain JS avec data.sym (= ComponentInstance dans le slot).
+        if (Array.isArray(val) && val.length > 0 && val[0] && val[0].data && val[0].data.sym) {
+          val.forEach(function(childObj, idx) {
+            count++;
+            var childSym = (childObj.data && childObj.data.sym) || {};
+            var childOverrides = childSym.overrides || {};
+
+            // Extraire les prop overrides en map propId → valeur lisible (text/link/bool).
+            var propOverridesExtracted = {};
+            Object.keys(childOverrides).forEach(function(pid) {
+              var pv = childOverrides[pid];
+              if (Array.isArray(pv) && pv.length > 0 && pv[0] && pv[0].data && typeof pv[0].data.value === 'string') {
+                // Text override format : [{ data: { value: "..." } }]
+                propOverridesExtracted[pid] = pv[0].data.value;
+              } else {
+                // Link/Bool/autre : structure brute conservée pour debug/audit.
+                propOverridesExtracted[pid] = pv;
+              }
+            });
+
+            var virtualEntry;
+            if (opts.compact) {
+              virtualEntry = { d: parentDepth + 1, type: 'Symbol', classes: [] };
+            } else {
+              virtualEntry = {
+                depth: parentDepth + 1,
+                type: 'Symbol',
+                tag: null,
+                id: childObj.id,
+                classes: [],
+                componentInstance: childSym.inst,
+                fromSlotOverride: true,
+                slotPropId: propId,
+                slotIndex: idx
+              };
+              if (Object.keys(propOverridesExtracted).length > 0) {
+                virtualEntry.propOverrides = propOverridesExtracted;
+              }
+            }
+            outArr.push(virtualEntry);
+          });
+        }
+      });
+      return count;
+    } catch (e) {
+      return 0;
+    }
+  }
+
   p._localCmd.dumpTree = function(args) {
     args = args || {};
     var maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 50;
@@ -1623,6 +1699,7 @@
     var compact = args.compact === true;
     var expandComponents = args.expandComponents === true;
     var hideTemplateRoots = args.hideTemplateRoots === true;
+    var expandSlotOverrides = args.expandSlotOverrides === true; // v3.3.0
     var rootIdScope = args.rootId || null;          // v1.6.0
     var includeParent = args.includeParent === true; // v1.6.0
     var entryOpts = {
@@ -1672,6 +1749,7 @@
     var out = [];
     var totalWalked = 0;
     var expandedCount = 0;
+    var slotOverridesCount = 0; // v3.3.0
     var parentStack = []; // v1.6.0 — [{ depth, id }] for includeParent
 
     function applyFiltersAndPush(entry, type, classes, text) {
@@ -1718,6 +1796,12 @@
 
       applyFiltersAndPush(built.entry, built.type, built.classes, built.text);
 
+      // v3.3.0 — expandSlotOverrides : for Symbol instances, reveal nested instances stored in
+      // data.sym.overrides[slotPropId] (slot children that the standard `children` walker misses).
+      if (expandSlotOverrides && built.type === 'Symbol') {
+        slotOverridesCount += expandSlotOverridesAt(node, depth, out, { compact: compact });
+      }
+
       // expandComponents: for Symbol instances, walk their template inline
       if (expandComponents && built.type === 'Symbol' && built.symInfo && built.symInfo.inst) {
         var template = templatesById[built.symInfo.inst];
@@ -1743,6 +1827,7 @@
 
     var result = { ok: true, count: out.length, total_walked: totalWalked, tree: out };
     if (expandComponents) result.expanded = expandedCount;
+    if (expandSlotOverrides) result.slot_overrides = slotOverridesCount; // v3.3.0
     if (rootIdScope) result.scoped_to = rootIdScope;
 
     // v1.6.0 — hint heuristics for count===0
