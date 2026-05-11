@@ -1,4 +1,4 @@
-/* Webflow Helper v3.5.1 - 2026-05-11 */
+/* Webflow Helper v3.5.2 - 2026-05-11 */
 
 /**
  * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
@@ -58,7 +58,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.5.1';
+  var VERSION = '3.5.2';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2202,9 +2202,9 @@
 
     if (mode === 'url') {
       if (typeof spec.url !== 'string') return 'invalid_url (requis pour mode=url)';
-      // 2b. Trouver l'input URL — pattern Webflow : input de type text dans le wrapper après le type selector
-      var urlInput = wrapper.querySelector('input[type="text"][data-automation-id*="External"], input[type="text"][placeholder*="https"], input[type="text"]:not([data-automation-id*="page-selector"])');
-      if (!urlInput) return 'url_input_not_found (mode=external) — re-tester ou ajouter sélecteur';
+      // 2b. v3.5.2 : sélecteur précis identifié empiriquement.
+      var urlInput = wrapper.querySelector('[data-automation-id="Type--Plugin_Text_URL"]');
+      if (!urlInput) return 'url_input_not_found (selector: [data-automation-id="Type--Plugin_Text_URL"])';
       urlInput.focus();
       setReactInputValue(urlInput, spec.url);
       urlInput.dispatchEvent(new Event('change', { bubbles: true }));
