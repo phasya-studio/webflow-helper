@@ -26,6 +26,14 @@
  *      → menu apparaît avec data-automation-id="component-property-reset" → click.
  *      Permet de re-mettre une instance à son default sans valeur arbitraire.
  *
+ * MINOR v3.6.0 (s550) : dumpTree `includeParent` default `true` (était `false`). Le
+ * `parent_id` est désormais ajouté à chaque entry par défaut — résout le bug walker
+ * "depth non fiable comme borne de subtree" (artefact Symbol expand). Consommateurs
+ * peuvent maintenant remonter la chaîne d'ancêtres pour identifier section + variant
+ * sémantique de toute Image sans dépendre du `d`. Backwards compat : ajout d'un champ
+ * dans les entries non-compact. Pour retomber sur l'ancien comportement passer
+ * `includeParent: false` explicitement.
+ *
  * MINOR v3.5.0 (s548 · Vague 2 partielle) : setComponentPropsViaUI étendu — supporte
  * désormais `type: 'link'` (mode='page' avec pageSlug, mode='url' avec url) +
  * `type: 'visibility'` (visible boolean). Total : 3 types couverts (text + link + visibility).
@@ -67,7 +75,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.5.3';
+  var VERSION = '3.6.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -1636,7 +1644,7 @@
    * @param {boolean} [args.hideTemplateRoots=false] When expandComponents=true, set this to true to filter out the original template root nodes (depth 1 with sym.root=true) from the main output to avoid duplication. Default false (templates appear both as their root + inline under Symbol instances).
    * @param {boolean} [args.expandSlotOverrides=false] v3.3.0 — Reveal ComponentInstance children nested in slot overrides. When a Symbol instance has `data.sym.overrides[slotPropId]` = array of nodes (typical for slots like `faq_list` in a Section FAQ component), walks those nodes as virtual children with `fromSlotOverride: true`, `slotPropId`, `slotIndex`. Extracts each child's own prop overrides into a `propOverrides: {propId: value}` map (text format `[{data:{value}}]` flattened to string; link/bool kept raw). Read-only. Result includes `slot_overrides: <count>`.
    * @param {string}  [args.rootId]            v1.6.0 — Scope walk to subtree rooted at this node ID (default: body root). Reduces payload 5-10× when working in a known subsection. Returns error if ID not found.
-   * @param {boolean} [args.includeParent=false] v1.6.0 — Add `parent_id` field to each entry (computed via depth-based stack during walk). Replaces the JS-side `findIndex + walk back` pattern. Only set when not compact. Skipped on virtual nodes from expandComponents.
+   * @param {boolean} [args.includeParent=true] v3.6.0 — Default true (était false v1.6.0). Adds `parent_id` field to each entry (computed via depth-based stack during walk). Replaces the JS-side `findIndex + walk back` pattern. Only set when not compact. Skipped on virtual nodes from expandComponents. Universal usage: walker générique pour identifier section + variant d'une Image en remontant la chaîne d'ancêtres (au lieu de slice-par-depth qui est cassé par les Symbol expand).
    * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, hint?: string, scoped_to?: string, error?: string }}
    *
    * v1.6.0 hint heuristics: when count===0, the response includes a `hint` field describing the most likely cause (low maxDepth, page not loaded, class spelling, text on non-text-bearing nodes). Empty hint = filter just doesn't match anything.
@@ -1721,7 +1729,7 @@
     var hideTemplateRoots = args.hideTemplateRoots === true;
     var expandSlotOverrides = args.expandSlotOverrides === true; // v3.3.0
     var rootIdScope = args.rootId || null;          // v1.6.0
-    var includeParent = args.includeParent === true; // v1.6.0
+    var includeParent = args.includeParent !== false; // v3.6.0 — default true (était === true en v1.6.0)
     var entryOpts = {
       compact: compact,
       includeText: args.includeText !== false && !compact,
