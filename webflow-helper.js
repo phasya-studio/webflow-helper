@@ -87,7 +87,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.7.0';
+  var VERSION = '3.8.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2556,6 +2556,144 @@
   console.log('[ImageSettings] 1 command registered: setImageSettings (alt[inherit/decorative/custom] · loading[lazy/eager/auto] — v3.7.0)');
 })();
 
+/**
+ * findNodeContext — résolveur structurel pour n'importe quel nodeId Webflow.
+ *
+ * Cmd: findNodeContext({nodeId})
+ *
+ * Élimine la friction du gotcha #31 (canon webflow-mcp-canon §cluster-component-instance) :
+ * "Element not found" quand un node est dans une ComponentInstance et qu'on essaie un
+ * set_style/set_image_asset/etc avec format {component: pageId, element: nodeId}.
+ *
+ * Retourne pour TOUT nodeId :
+ *   - isInComponent          : bool, true si le node est ENFANT d'une ComponentInstance
+ *   - isComponentInstance    : bool, true si le node EST lui-même une ComponentInstance (Symbol)
+ *   - templateId             : id du Component template (null si native page node)
+ *   - instanceId             : id de la Symbol instance sur la page (null si native ou si l'on demande la Symbol elle-même → instanceId = nodeId)
+ *   - pageId                 : id de la page courante
+ *   - mcpIdFormat            : {component, element} prêt à passer à set_style/set_image_asset/etc.
+ *   - openInstanceFormat     : {component, element} prêt à passer à open_component_view (null si pas dans Component)
+ *   - note                   : workflow recommandé en 1 phrase
+ *
+ * Workflow type pour modifier un enfant d'une instance Component :
+ *   1. ctx = findNodeContext({nodeId: <child native id>})
+ *   2. open_component_view({component_instance_id: ctx.openInstanceFormat})
+ *   3. set_image_asset/set_style/etc({id: ctx.mcpIdFormat, ...})
+ *   4. close_component_view
+ *
+ * Performance : ~100ms (1 dumpTree expandComponents + 1 getCurrentPageInfo séquentiels).
+ * v3.8.0 (s551).
+ */
+(function() {
+  'use strict';
+
+  if (!window.__webflowHelper) return;
+  var p = window.__webflowHelper;
+  if (!p._localCmd) p._localCmd = {};
+
+  p._localCmd.findNodeContext = async function(args) {
+    args = args || {};
+    var nodeId = args.nodeId;
+    if (!nodeId || typeof nodeId !== 'string') {
+      return { ok: false, error: 'missing_or_invalid_nodeId', got: typeof nodeId };
+    }
+
+    // 1. dumpTree avec expandComponents (révèle les enfants des Symbol templates)
+    var dump;
+    try {
+      dump = await p._localCmd.dumpTree({
+        maxDepth: 30,
+        expandComponents: true,
+        compact: false
+      });
+    } catch (e) {
+      return { ok: false, error: 'dumpTree_threw', message: String(e && e.message || e) };
+    }
+    if (!dump || !dump.ok) {
+      return { ok: false, error: 'dumpTree_failed', dump: dump };
+    }
+
+    // 2. Page courante
+    var pageInfo;
+    try {
+      pageInfo = await p._localCmd.getCurrentPageInfo();
+    } catch (e) {
+      pageInfo = null;
+    }
+    var pageId = pageInfo && pageInfo.page && pageInfo.page.id;
+
+    // 3. Trouve toutes les entries qui matchent le nodeId
+    var entries = dump.tree.filter(function(n) { return n.id === nodeId; });
+    if (entries.length === 0) {
+      return {
+        ok: true, found: false, nodeId: nodeId, pageId: pageId,
+        message: 'Node not found in dumpTree · check nodeId or wrong page (current: ' + pageId + ')'
+      };
+    }
+
+    // 4. Cas A : Le node EST une Symbol instance (ComponentInstance)
+    var symbolEntry = entries.find(function(n) {
+      return n.type === 'Symbol' && n.componentInstance;
+    });
+    if (symbolEntry) {
+      return {
+        ok: true,
+        found: true,
+        nodeId: nodeId,
+        isInComponent: false,
+        isComponentInstance: true,
+        templateId: symbolEntry.componentInstance,
+        instanceId: nodeId,
+        pageId: pageId,
+        mcpIdFormat: { component: pageId, element: nodeId },
+        openInstanceFormat: { component: pageId, element: nodeId },
+        note: 'Node IS a Symbol instance · open_component_view({component: pageId, element: nodeId}) puis edit children avec {component: templateId, element: childId}'
+      };
+    }
+
+    // 5. Cas B : Le node est ENFANT d'un Component template (rendered inline via expandComponents)
+    var fromTplEntry = entries.find(function(n) { return n.fromTemplate; });
+    if (fromTplEntry) {
+      var templateId = fromTplEntry.fromTemplate;
+      // Cherche la Symbol instance sur la page qui pointe vers ce template
+      var instance = dump.tree.find(function(n) {
+        return n.type === 'Symbol' && n.componentInstance === templateId;
+      });
+      var instanceId = instance ? instance.id : null;
+      return {
+        ok: true,
+        found: true,
+        nodeId: nodeId,
+        isInComponent: true,
+        isComponentInstance: false,
+        templateId: templateId,
+        instanceId: instanceId,
+        pageId: pageId,
+        mcpIdFormat: { component: templateId, element: nodeId },
+        openInstanceFormat: instanceId ? { component: pageId, element: instanceId } : null,
+        note: 'Node INSIDE Component template · workflow: open_component_view(openInstanceFormat) → set_X(mcpIdFormat) → close_component_view'
+      };
+    }
+
+    // 6. Cas C : Native page node (rien de spécial)
+    return {
+      ok: true,
+      found: true,
+      nodeId: nodeId,
+      isInComponent: false,
+      isComponentInstance: false,
+      templateId: null,
+      instanceId: null,
+      pageId: pageId,
+      mcpIdFormat: { component: pageId, element: nodeId },
+      openInstanceFormat: null,
+      note: 'Native page node · use {component: pageId, element: nodeId} directly with set_X / element_tool MCP'
+    };
+  };
+
+  console.log('[FindNodeContext] 1 command registered: findNodeContext (resolves Component context for any nodeId — v3.8.0)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -2570,6 +2708,7 @@
     'renameNode',
     'setComponentPropsViaUI',
     'setImageSettings',
+    'findNodeContext',
     'listEmbeds',
     'getEmbedContent',
     'getCurrentPageInfo',
