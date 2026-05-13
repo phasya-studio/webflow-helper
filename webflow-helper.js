@@ -108,7 +108,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.11.1';
+  var VERSION = '3.11.2';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2962,8 +2962,8 @@
 
     for (var i = 0; i < items.length; i++) {
       var item = items[i];
-      if (!item.nodeId) {
-        failed.push({ index: i, reason: 'nodeId required' });
+      if (!item.nodeId && !item.srcKey) {
+        failed.push({ index: i, reason: 'nodeId or srcKey required' });
         continue;
       }
       var err = await applyOne(item, waitMs);
