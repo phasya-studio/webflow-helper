@@ -96,7 +96,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.9.0';
+  var VERSION = '3.10.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -659,6 +659,29 @@
     if (!embedId) return { ok: false, error: 'embedId required' };
     if (typeof content !== 'string') return { ok: false, error: 'content (string) required' };
 
+    // [v3.10.0] Tracking for fingerprint fallback resolution
+    var resolvedBy = null;
+    var originalEmbedId = embedId;
+
+    // [v3.10.0] Extract a stable signature from content : 1st significant line
+    // (skipped : empty, pure decorative === / ─, comment delimiters alone).
+    // Used to recover the current embed ID when the caller's stored ID is stale
+    // (Webflow auto-regenerates embed IDs on delete+recreate, refactor to Component, etc.)
+    function extractFingerprint(html) {
+      if (!html || typeof html !== 'string') return null;
+      var lines = html.split('\n');
+      for (var i = 0; i < Math.min(lines.length, 20); i++) {
+        var line = lines[i].trim();
+        if (!line) continue;
+        line = line.replace(/^(<!--|\/\/|\/\*|\*)+\s*/, '').replace(/\s*(-->|\*\/)$/, '').trim();
+        if (!line) continue;
+        if (/^[=\-─━_*\s]+$/.test(line)) continue; // pure decorative line
+        if (line.length < 8) continue;
+        return line.substring(0, 80);
+      }
+      return null;
+    }
+
     var DELAYS = {
       afterDeselect: waitMs.afterDeselect || 250,
       afterDblClick: waitMs.afterDblClick || 600,
@@ -686,7 +709,44 @@
 
     if (!embedEl) {
       embedEl = canvasDoc.querySelector('[data-wf-id*="' + embedId + '"]');
-      if (!embedEl) return { ok: false, error: 'embed not found in canvas DOM', embedId: embedId };
+
+      // [v3.10.0] Fingerprint fallback : si pas trouvé par ID, match by content signature
+      if (!embedEl) {
+        var fp = extractFingerprint(content);
+        if (fp) {
+          var allEmbedsResult = p._localCmd.listEmbeds();
+          if (allEmbedsResult && allEmbedsResult.ok) {
+            var matches = allEmbedsResult.embeds.filter(function(e) {
+              var theirFp = extractFingerprint(e.preview);
+              return theirFp && theirFp.toLowerCase() === fp.toLowerCase();
+            });
+            if (matches.length === 1) {
+              embedId = matches[0].id;
+              resolvedBy = 'signature';
+              embedEl = canvasDoc.querySelector('[data-w-id="' + embedId + '"]')
+                     || canvasDoc.querySelector('[data-wf-id*="' + embedId + '"]');
+            } else if (matches.length > 1) {
+              return {
+                ok: false,
+                error: 'embed not found by ID; fingerprint matched ' + matches.length + ' embeds (ambiguous)',
+                embedId: originalEmbedId,
+                fingerprint: fp,
+                candidates: matches.map(function(m) {
+                  return { id: m.id, preview: m.preview.substring(0, 60) };
+                })
+              };
+            }
+          }
+        }
+        if (!embedEl) {
+          return {
+            ok: false,
+            error: 'embed not found in canvas DOM (fingerprint fallback ' + (fp ? 'no match' : 'no fingerprint extractable') + ')',
+            embedId: originalEmbedId,
+            fingerprint: fp
+          };
+        }
+      }
       try {
         var path = JSON.parse(embedEl.getAttribute('data-wf-id') || '[]');
         if (Array.isArray(path) && path.length > 1) {
@@ -781,7 +841,7 @@
     var verify = p._localCmd.getEmbedContent({ embedId: embedId });
     var success = !!(verify && verify.ok && verify.value === content);
 
-    return {
+    var result = {
       ok: success,
       success: success,
       embedId: embedId,
@@ -794,6 +854,13 @@
       error: success ? undefined : 'content verification mismatch after save (expected ' + content.length + ' chars, got ' + (verify && verify.length) + ')',
       verify_ok: !!(verify && verify.ok)
     };
+    // [v3.10.0] Signal fingerprint resolution so caller can sync its source file
+    if (resolvedBy) {
+      result.resolved_by = resolvedBy;
+      result.old_id = originalEmbedId;
+      result.new_id = embedId;
+    }
+    return result;
   };
 
   /**
