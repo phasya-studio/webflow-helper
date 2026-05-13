@@ -108,7 +108,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.11.2';
+  var VERSION = '3.12.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2311,17 +2311,23 @@
     if (!wrapper) return 'wrapper_not_found pour prop link "' + propName + '"';
 
     var mode = spec.mode;
-    if (mode !== 'page' && mode !== 'url') {
-      return 'link_mode_not_supported: "' + mode + '" (Vague 2 supporte mode=page et mode=url · email/phone/section/file à venir)';
+    if (mode !== 'page' && mode !== 'url' && mode !== 'phone' && mode !== 'email') {
+      return 'link_mode_not_supported: "' + mode + '" (v3.12.0 supporte mode=page/url/phone/email · section/file à venir)';
     }
 
     // 1. S'assurer que le Type est correct (click radio si pas déjà actif).
-    var typeButtonId = mode === 'page' ? 'Type--Plugin_Enum_Type_button-page' : 'Type--Plugin_Enum_Type_button-external';
+    var typeButtonMap = {
+      'page': 'Type--Plugin_Enum_Type_button-page',
+      'url': 'Type--Plugin_Enum_Type_button-external',
+      'phone': 'Type--Plugin_Enum_Type_button-tel',
+      'email': 'Type--Plugin_Enum_Type_button-email'
+    };
+    var typeButtonId = typeButtonMap[mode];
     var typeBtn = wrapper.querySelector('[data-automation-id="' + typeButtonId + '"]');
     if (!typeBtn) return 'type_button_not_found: ' + typeButtonId;
     if (typeBtn.getAttribute('aria-checked') !== 'true') {
       typeBtn.click();
-      await new Promise(function(r) { setTimeout(r, 200); });
+      await new Promise(function(r) { setTimeout(r, 300); });
     }
 
     if (mode === 'page') {
@@ -2364,7 +2370,133 @@
       return null;
     }
 
+    if (mode === 'phone' || mode === 'email') {
+      // v3.12.0 — Phone/Email link : input + Tab keydown pour commit Redux (validé empirique s552ter sur 8 zones).
+      // Sans Tab keydown : Redux stocke {mode:"phone"} sans `to` value (input visible mais pas committé).
+      var fieldKey = mode === 'phone' ? 'phone' : 'email';
+      var specKey = mode === 'phone' ? 'phone' : 'email';
+      var inputSelector = mode === 'phone' ? 'Type--Plugin_Text_Phone' : 'Type--Plugin_Text_Email';
+      var valueProvided = spec[specKey];
+      // Fallback : accepter aussi `spec.value` ou `spec.to` pour ergonomie
+      if (typeof valueProvided !== 'string') valueProvided = spec.value;
+      if (typeof valueProvided !== 'string') valueProvided = spec.to;
+      if (typeof valueProvided !== 'string') {
+        return 'invalid_' + fieldKey + ' (requis pour mode=' + mode + ' : spec.' + specKey + ' ou spec.value ou spec.to · string ' + (mode === 'phone' ? '"+33232540191" format E.164' : '"contact@example.com"') + ')';
+      }
+      var inp = wrapper.querySelector('[data-automation-id="' + inputSelector + '"]');
+      if (!inp) return inputSelector + '_input_not_found';
+      inp.focus();
+      // Clear any existing value avant set (évite concat)
+      setReactInputValue(inp, '');
+      await new Promise(function(r) { setTimeout(r, 100); });
+      setReactInputValue(inp, valueProvided);
+      // Le Tab keydown est essentiel pour commit Redux côté Webflow (validé s552ter).
+      // change + blur seul stocke {mode:"phone"} sans `to` value.
+      ['keydown', 'keyup'].forEach(function(t) {
+        inp.dispatchEvent(new KeyboardEvent(t, {
+          key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
+          bubbles: true, cancelable: true
+        }));
+      });
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      inp.blur();
+      await new Promise(function(r) { setTimeout(r, 300); });
+      return null;
+    }
+
     return 'link_mode_unhandled';
+  }
+
+  // v3.12.0 — Variant prop : dropdown select pour Color/Size/etc. (validé empirique s552ter
+  // sur 8 zones + 12 services pour Master Button Color Ivoire vs Cardinal).
+  // Pattern : click trigger → dropdown s'ouvre → click option [data-automation-id="Type--Plugin_StyleVariant_{propName}-option-{variantId}"]
+  //
+  // Stratégie click multi-niveau (le click JS natif peut être ignoré par React) :
+  //   1. focus option + dispatch keyboard Enter (le pattern qui marche pour radio Webflow)
+  //   2. fallback : dispatch click natif avec composedPath
+  //   3. fallback : direct option.click()
+  //
+  // spec.variant peut être :
+  //   - 'ivoire' / 'cardinal' / 'grenat' (label human → résolution par textContent)
+  //   - 'b387bcc0-2496-4d39-7a0a-daf6a4981c98' (variant ID directe · plus fiable)
+  //   - 'base' (default variant)
+  async function applyVariantProp(propName, spec) {
+    var triggerSelector = '[data-automation-id="Type--Plugin_StyleVariant_' + propName + '"]';
+    var trigger = document.querySelector(triggerSelector);
+    if (!trigger) return 'trigger_not_found: ' + triggerSelector;
+
+    var requested = spec.variant;
+    // Fallback : accepter aussi spec.value pour ergonomie
+    if (typeof requested !== 'string') requested = spec.value;
+    if (typeof requested !== 'string') return 'invalid_variant (requis : spec.variant ou spec.value · string · label "ivoire" ou variant ID UUID)';
+
+    // 1. Open dropdown
+    trigger.click();
+    await new Promise(function(r) { setTimeout(r, 400); });
+
+    // 2. Find option — try direct ID match first, fallback to label match
+    var allOptions = Array.from(document.querySelectorAll('[data-automation-id^="Type--Plugin_StyleVariant_' + propName + '-option-"]'));
+    var option = null;
+    var reqLower = requested.toLowerCase();
+    for (var i = 0; i < allOptions.length; i++) {
+      var opt = allOptions[i];
+      var autoId = opt.getAttribute('data-automation-id') || '';
+      var label = (opt.textContent || '').trim().toLowerCase();
+      // Match by suffix (variant ID) OR by label text
+      if (autoId.endsWith('-option-' + requested) || label === reqLower) {
+        option = opt;
+        break;
+      }
+    }
+    if (!option) {
+      // Close dropdown
+      document.body.click();
+      return 'variant_option_not_found: "' + requested + '" — disponibles: [' + allOptions.map(function(o) { return (o.textContent||'').trim(); }).join(', ') + ']';
+    }
+
+    // 3. Try multiple click strategies (React-compatible)
+    var initialState = trigger.textContent.trim();
+    // Strategy 1: keyboard Enter on focused option (pattern visibility radio)
+    try {
+      option.focus();
+      ['keydown', 'keypress', 'keyup'].forEach(function(t) {
+        option.dispatchEvent(new KeyboardEvent(t, {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+          bubbles: true, cancelable: true
+        }));
+      });
+      await new Promise(function(r) { setTimeout(r, 400); });
+      if (trigger.textContent.trim() !== initialState) return null;
+    } catch (e) { /* fallback */ }
+
+    // Strategy 2: dispatched MouseEvents with composedPath
+    try {
+      var rect = option.getBoundingClientRect();
+      var x = rect.left + rect.width / 2;
+      var y = rect.top + rect.height / 2;
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(t) {
+        var Ctor = t.startsWith('pointer') ? PointerEvent : MouseEvent;
+        option.dispatchEvent(new Ctor(t, {
+          bubbles: true, cancelable: true, view: window,
+          clientX: x, clientY: y, button: 0,
+          pointerType: t.startsWith('pointer') ? 'mouse' : undefined,
+          composed: true
+        }));
+      });
+      await new Promise(function(r) { setTimeout(r, 400); });
+      if (trigger.textContent.trim() !== initialState) return null;
+    } catch (e) { /* fallback */ }
+
+    // Strategy 3: simple .click()
+    try {
+      option.click();
+      await new Promise(function(r) { setTimeout(r, 400); });
+      if (trigger.textContent.trim() !== initialState) return null;
+    } catch (e) { /* fallback */ }
+
+    // All strategies failed
+    document.body.click(); // close dropdown
+    return 'variant_click_failed_react_dropdown — fallback: utiliser mcp__chrome-devtools__click avec uid de take_snapshot · option visible était [data-automation-id="' + option.getAttribute('data-automation-id') + '"]';
   }
 
   // v3.5.0 — Visibility (boolean) : 2 buttons Visible/Hidden dans le wrapper.
@@ -2484,9 +2616,13 @@
         var errR = await applyResetProp(name);
         if (errR) failed.push({ propName: name, reason: errR });
         else applied.push(name);
+      } else if (type === 'variant') {
+        var errVar = await applyVariantProp(name, spec);
+        if (errVar) failed.push({ propName: name, reason: errVar });
+        else applied.push(name);
       } else {
-        // À venir (Vague 3) : image, number, richText, link mode={email|phone|section|file}
-        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (v3.5.3 supporte text/link(page,url)/visibility/reset · à venir : image/number/richText/link(email,phone,section,file))' });
+        // À venir : image, number, richText, link mode={section|file}
+        failed.push({ propName: name, reason: 'type_not_yet_supported: "' + type + '" (v3.12.0 supporte text/link(page,url,phone,email)/visibility/reset/variant · à venir : image/number/richText/link(section,file))' });
       }
 
       // Petit délai entre props pour éviter race condition React renders
@@ -2501,7 +2637,7 @@
     };
   };
 
-  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (types: text · link[page,url] · visibility · reset — v3.5.3)');
+  console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (types: text · link[page,url,phone,email] · visibility · reset · variant — v3.12.0)');
 })();
 
 /* =========================================================================
