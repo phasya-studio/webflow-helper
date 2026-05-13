@@ -108,7 +108,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.11.0';
+  var VERSION = '3.11.1';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2860,10 +2860,19 @@
     var doc = canvas.contentDocument;
     if (!doc) return 'canvas contentDocument not accessible';
 
-    // 1. Locate image via data-w-id (assumes Component view open via MCP)
-    var imgEl = doc.querySelector('[data-w-id="' + item.nodeId + '"]');
+    // 1. Locate image — strategie hybride (s552 v3.11.1) :
+    //    a) tenter data-w-id direct (rapide MAIS souvent absent tant que l'image n'a pas
+    //       ete clickee une fois dans le canvas Designer — pattern Webflow Component view)
+    //    b) fallback srcKey si fourni : doc.querySelectorAll('img[src*="srcKey"]')[srcIndex]
+    //    Args attendus : {nodeId?, srcKey?, srcIndex?, altMode, altCustomText?}
+    var imgEl = item.nodeId ? doc.querySelector('[data-w-id="' + item.nodeId + '"]') : null;
+    if (!imgEl && item.srcKey) {
+      var allMatches = doc.querySelectorAll('img[src*="' + item.srcKey + '"]');
+      var idx = typeof item.srcIndex === 'number' ? item.srcIndex : 0;
+      imgEl = allMatches[idx] || null;
+    }
     if (!imgEl) {
-      return 'image not found via data-w-id (Component view not open ? check MCP open_component_view called first)';
+      return 'image not found (data-w-id "' + (item.nodeId || 'absent') + '" + srcKey "' + (item.srcKey || 'absent') + '" unmatched · Component view open ?)';
     }
 
     // 2. Click image (NO body.click — stay in Component view)
