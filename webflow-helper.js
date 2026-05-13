@@ -1,7 +1,7 @@
-/* Webflow Helper v3.5.3 - 2026-05-12 */
+/* Webflow Helper v3.7.0 - 2026-05-13 */
 
 /**
- * Webflow Helper — minimal surface, exposes 10 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 11 cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
@@ -9,13 +9,25 @@
  * 4. updateEmbedViaUI — write content via UI automation (CodeMirror paste + Save click)
  * 5. renameNode — rename any node (HtmlEmbed, DIV, Section, etc.) via 3 Redux dispatches (v3.1.0)
  * 6. setComponentPropsViaUI — override ComponentInstance properties via UI automation (v3.4.0/v3.5.0)
- * 7. listEmbeds — list embeds + their contents (no MCP tool)
- * 8. getEmbedContent — read a single embed's content (no MCP tool)
- * 9. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
- * 10. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+ * 7. setImageSettings — set Image alt mode (inherit/decorative/custom) + loading type (lazy/eager/auto) (v3.7.0)
+ * 8. listEmbeds — list embeds + their contents (no MCP tool)
+ * 9. getEmbedContent — read a single embed's content (no MCP tool)
+ * 10. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
+ * 11. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.7.0 (s551) : setImageSettings — UI automation pour reset alt mode +
+ * change loading type sur Image elements. Contournement structurel du gotcha #34
+ * (canon webflow-mcp-canon.md §cluster-image-asset) : altText "Custom description"
+ * sur Image existant = NON-RESET via MCP (6 routes testées s538 toutes silent-fail).
+ * Sélecteurs data-automation-id stables identifiés empirique s551 :
+ *   - AltTextPluginDropdown → select-option-__wf_reserved_{inherit|decorative}|custom
+ *   - AltTextPluginInput (React nativeInputValueSetter pour custom text)
+ *   - Type--Plugin_Enum_Type_menu → menu-option-{lazy|eager|auto}
+ * Compatible s548 : aucun dispatch Redux write (only DOM events).
+ * Validé empirique : 13 hero images AVG resetées (alt:inherit + loading:eager).
  *
  * PATCH v3.5.3 (s549) : 2 fixes critiques sur setComponentPropsViaUI :
  *   1. applyVisibilityProp — `btn.click()` natif IGNORÉ par les radio Webflow
@@ -75,7 +87,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.6.0';
+  var VERSION = '3.7.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2369,6 +2381,181 @@
   console.log('[ComponentProps] 1 command registered: setComponentPropsViaUI (types: text · link[page,url] · visibility · reset — v3.5.3)');
 })();
 
+/* =========================================================================
+ * Cmd: setImageSettings({nodeId, alt?, altCustomText?, loading?, waitMs?})  v3.7.0
+ *
+ * Workaround structurel pour le gotcha #34 (canon webflow-mcp-canon.md) :
+ *   altText "Custom description" sur Image existant = NON-RESET via MCP
+ *   (6 routes testées s538 toutes silent-fail).
+ *
+ * Cette cmd contourne via UI automation pure DOM (sélecteurs data-automation-id
+ * stables identifiés empirique s551 sur AVG) :
+ *   1. Deselect canvas (body.click)
+ *   2. Select image via canvas data-w-id click
+ *   3. Open right-sidebar Settings tab
+ *   4. Si `alt` : AltTextPluginDropdown → select-option-__wf_reserved_{inherit|decorative}|custom
+ *       (+ AltTextPluginInput nativeSetter si alt='custom' avec altCustomText)
+ *   5. Si `loading` : Type--Plugin_Enum_Type_menu → menu-option-{lazy|eager|auto}
+ *
+ * Modes alt :
+ *   - 'inherit'     → "Use alt text from asset"   (lit asset.altText configuré au upload)
+ *   - 'decorative'  → "Decorative"                (alt="" rendu HTML · pour images décoratives)
+ *   - 'custom'      → "Custom description"        (texte custom · requiert altCustomText)
+ *
+ * Modes loading :
+ *   - 'eager'       → loading="eager" rendu HTML  (recommandé pour hero / above-the-fold)
+ *   - 'lazy'        → loading="lazy"              (défaut Webflow · images below-the-fold)
+ *   - 'auto'        → pas de loading attr         (défaut navigateur)
+ *
+ * Limites empirique v3.7.0 :
+ *   - Images NATIVES uniquement (data-w-id direct). Component instance support : à venir.
+ *   - Pas de validation post-save (settings panel update Redux instantanément).
+ *
+ * Performance attendue : ~2-3s par image (sélection + open settings + 1-2 dropdowns).
+ *
+ * @see docs/lessons/webflow-helper-canon.md §setimagesettings (à ajouter)
+ * @see docs/lessons/webflow-mcp-canon.md §cluster-image-asset (gotcha #34 contourné)
+ * ========================================================================= */
+(function setImageSettingsCmd() {
+  if (!window.__webflowHelper || !window.__webflowHelper._localCmd) {
+    console.warn('[ImageSettings] __webflowHelper not ready — registration skipped');
+    return;
+  }
+  var p = window.__webflowHelper;
+
+  function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  // Apply alt mode (+ optional custom text if mode='custom')
+  async function applyAlt(altMode, customText, waitMs) {
+    var dd = document.querySelector('[data-automation-id="AltTextPluginDropdown"]');
+    if (!dd) return 'AltTextPluginDropdown not found (image settings panel did not render?)';
+
+    var targetOpts = {
+      'inherit':    'select-option-__wf_reserved_inherit',
+      'decorative': 'select-option-__wf_reserved_decorative',
+      'custom':     'select-option-custom'
+    };
+    var optId = targetOpts[altMode];
+    if (!optId) return 'invalid_alt_mode (expected inherit/decorative/custom, got "' + altMode + '")';
+
+    var labels = {
+      'inherit':    'Use alt text from asset',
+      'decorative': 'Decorative',
+      'custom':     'Custom description'
+    };
+    var alreadySet = (dd.textContent || '').indexOf(labels[altMode]) !== -1;
+    if (!alreadySet) {
+      dd.click();
+      await wait(waitMs);
+      var opt = document.querySelector('[data-automation-id="' + optId + '"]');
+      if (!opt) return 'option not found: ' + optId;
+      opt.click();
+      await wait(waitMs);
+    }
+
+    // Custom mode + text → set value via React nativeInputValueSetter
+    if (altMode === 'custom' && typeof customText === 'string') {
+      var input = document.querySelector('[data-automation-id="AltTextPluginInput"]');
+      if (!input) return 'AltTextPluginInput not found (custom mode requires input present)';
+      var proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(input, customText);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+      await wait(waitMs);
+    }
+    return null;
+  }
+
+  // Apply loading type (lazy/eager/auto)
+  async function applyLoading(loadingMode, waitMs) {
+    var menu = document.querySelector('[data-automation-id="Type--Plugin_Enum_Type_menu"]');
+    if (!menu) return 'Type--Plugin_Enum_Type_menu not found';
+    var labels = { 'lazy': 'Lazy', 'eager': 'Eager', 'auto': 'Auto' };
+    var label = labels[loadingMode];
+    if (!label) return 'invalid_loading_mode (expected lazy/eager/auto, got "' + loadingMode + '")';
+
+    if ((menu.textContent || '').indexOf(label) !== -1) return null; // already set
+    menu.click();
+    await wait(waitMs);
+    var opt = document.querySelector('[data-automation-id="Type--Plugin_Enum_Type_menu-option-' + loadingMode + '"]');
+    if (!opt) return 'loading option not found: ' + loadingMode;
+    opt.click();
+    await wait(waitMs);
+    return null;
+  }
+
+  p._localCmd.setImageSettings = async function(args) {
+    args = args || {};
+    var nodeId = args.nodeId;
+    var alt = args.alt;
+    var altCustomText = args.altCustomText;
+    var loading = args.loading;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 500;
+
+    if (!nodeId) return { ok: false, error: 'nodeId required' };
+    if (!alt && !loading) return { ok: false, error: 'no_action (provide alt and/or loading)' };
+
+    var start = Date.now();
+    var applied = [];
+    var failed = [];
+
+    // 1. Locate canvas iframe
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    if (!canvas) return { ok: false, error: 'canvas iframe not found' };
+    var canvasDoc = canvas.contentDocument;
+    if (!canvasDoc) return { ok: false, error: 'canvas iframe contentDocument not accessible' };
+
+    // 2. Find image element (native page only — Component instance support à venir)
+    var imgEl = canvasDoc.querySelector('[data-w-id="' + nodeId + '"]');
+    if (!imgEl) {
+      return {
+        ok: false,
+        error: 'image not found in canvas DOM (Component instance support pending v3.8)',
+        nodeId: nodeId,
+        durationMs: Date.now() - start
+      };
+    }
+
+    // 3. Deselect + click image
+    canvasDoc.body.click();
+    await wait(300);
+    imgEl.click();
+    await wait(600);
+
+    // 4. Open Settings tab
+    var settingsTab = document.querySelector('[data-automation-id="right-sidebar-settings-tab-link"]');
+    if (!settingsTab) return { ok: false, error: 'Settings tab not found', durationMs: Date.now() - start };
+    settingsTab.click();
+    await wait(600);
+
+    // 5. Apply alt mode
+    if (alt) {
+      var altErr = await applyAlt(alt, altCustomText, waitMs);
+      if (altErr) failed.push({ action: 'alt', reason: altErr });
+      else applied.push('alt:' + alt + (alt === 'custom' && altCustomText ? ' (custom text set)' : ''));
+    }
+
+    // 6. Apply loading mode
+    if (loading) {
+      var loadErr = await applyLoading(loading, waitMs);
+      if (loadErr) failed.push({ action: 'loading', reason: loadErr });
+      else applied.push('loading:' + loading);
+    }
+
+    return {
+      ok: failed.length === 0,
+      nodeId: nodeId,
+      applied: applied,
+      failed: failed,
+      durationMs: Date.now() - start
+    };
+  };
+
+  console.log('[ImageSettings] 1 command registered: setImageSettings (alt[inherit/decorative/custom] · loading[lazy/eager/auto] — v3.7.0)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -2382,6 +2569,7 @@
     'updateEmbedViaUI',
     'renameNode',
     'setComponentPropsViaUI',
+    'setImageSettings',
     'listEmbeds',
     'getEmbedContent',
     'getCurrentPageInfo',
