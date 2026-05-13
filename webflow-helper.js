@@ -1,4 +1,4 @@
-/* Webflow Helper v3.7.0 - 2026-05-13 */
+/* Webflow Helper v3.10.0 - 2026-05-13 */
 
 /**
  * Webflow Helper — minimal surface, exposes 11 cmds via `__webflowHelper.run()`:
@@ -17,6 +17,18 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.10.0 (s549) : updateEmbedViaUI — fingerprint fallback resolution.
+ * Quand embedId ne trouve aucun match dans le canvas DOM (ID volatile : Webflow
+ * regenere les IDs au delete+recreate ou refactor en Component), le helper extrait
+ * la 1ère ligne significative du `content` fourni (skip décoratif === / ─, comment
+ * delimiters), call listEmbeds, match preview par signature normalisée. Si match
+ * unique → résolution auto + update + return enrichi `{resolved_by:'signature',
+ * old_id, new_id}` pour que le caller sync son fichier source. Match ambigu (≥2)
+ * → fail avec `candidates[]` pour debug. Match 0 → fail explicite avec fingerprint
+ * tenté. Validé empirique s549 : embed services accueil avait changé d'ID entre
+ * sessions (b73fd0d9 → 998737ec après refactor en Component instance), résolution
+ * manuelle via listEmbeds → désormais auto.
  *
  * MINOR v3.7.0 (s551) : setImageSettings — UI automation pour reset alt mode +
  * change loading type sur Image elements. Contournement structurel du gotcha #34
@@ -96,7 +108,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.10.0';
+  var VERSION = '3.11.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2805,6 +2817,172 @@
   console.log('[FindNodeContext] 1 command registered: findNodeContext (resolves Component context for any nodeId — v3.8.0)');
 })();
 
+/* ===========================================================================
+ * Cmd: helpEditImagesAltInComponent({items, waitMs?})  v3.11.0
+ *
+ * Workflow mecanise pour modifier alt mode de N images DANS un Component template
+ * deja ouvert via MCP `de_component_tool.open_component_view`.
+ *
+ * Cmd a creer pour eliminer la friction identifiee en session s552 :
+ *   setImageSettings v3.10.0 echoue sur images de Component instance car son
+ *   body.click() initial sort de Component view (silent loss du contexte
+ *   data-w-id). Cette cmd skip body.click + skip imgEl.click pre-setup et
+ *   suppose le contexte Component view actif (caller responsibility).
+ *
+ * Workflow caller :
+ *   1. mcp__webflow__de_component_tool.open_component_view({...})  ← MCP
+ *   2. helper.run('helpEditImagesAltInComponent', {items: [...]})  ← cette cmd
+ *   3. mcp__webflow__de_component_tool.close_component_view        ← MCP
+ *
+ * Items: [{nodeId, altMode: 'inherit'|'decorative'|'custom', altCustomText?}]
+ *
+ * Differences vs setImageSettings v3.10 :
+ * - PAS de body.click au debut (qui fermerait Component view)
+ * - Batch de N items (1 call = N images, ~2-3s par image)
+ * - Press Enter key apres altCustomText pour commit Redux (validated s552)
+ * - Idempotent : si dropdown deja en altMode demande, skip et marque applied
+ *
+ * Performance attendue : ~2-3s par image (selection + Settings tab + dropdown).
+ * ========================================================================= */
+
+(function helpEditImagesAltInComponentCmd() {
+  if (!window.__webflowHelper || !window.__webflowHelper._localCmd) {
+    console.warn('[HelpEditImagesAltInComponent] __webflowHelper not ready — registration skipped');
+    return;
+  }
+  var p = window.__webflowHelper;
+
+  function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  async function applyOne(item, waitMs) {
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    if (!canvas) return 'canvas iframe not found';
+    var doc = canvas.contentDocument;
+    if (!doc) return 'canvas contentDocument not accessible';
+
+    // 1. Locate image via data-w-id (assumes Component view open via MCP)
+    var imgEl = doc.querySelector('[data-w-id="' + item.nodeId + '"]');
+    if (!imgEl) {
+      return 'image not found via data-w-id (Component view not open ? check MCP open_component_view called first)';
+    }
+
+    // 2. Click image (NO body.click — stay in Component view)
+    var rect = imgEl.getBoundingClientRect();
+    imgEl.dispatchEvent(new MouseEvent('click', {
+      bubbles: true, cancelable: true,
+      clientX: rect.left + 5, clientY: rect.top + 5, button: 0
+    }));
+    await wait(waitMs);
+
+    // 3. Open Settings tab (idempotent)
+    var settingsTab = document.querySelector('[data-automation-id="right-sidebar-settings-tab-link"]');
+    if (settingsTab) {
+      settingsTab.click();
+      await wait(400);
+    }
+
+    // 4. Open AltText dropdown
+    var dd = document.querySelector('[data-automation-id="AltTextPluginDropdown"]');
+    if (!dd) return 'AltTextPluginDropdown not found (Settings panel not for Image type ?)';
+
+    var altLabels = {
+      inherit: 'Use alt text from asset',
+      decorative: 'Decorative',
+      custom: 'Custom description'
+    };
+    var altOpts = {
+      inherit: 'select-option-__wf_reserved_inherit',
+      decorative: 'select-option-__wf_reserved_decorative',
+      custom: 'select-option-custom'
+    };
+
+    var mode = item.altMode || 'inherit';
+    if (!altLabels[mode]) return 'invalid altMode: ' + mode + ' (expected inherit/decorative/custom)';
+
+    var alreadySet = (dd.textContent || '').indexOf(altLabels[mode]) !== -1;
+    if (!alreadySet) {
+      dd.click();
+      await wait(500);
+      var opt = document.querySelector('[data-automation-id="' + altOpts[mode] + '"]');
+      if (!opt) return 'option not found: ' + altOpts[mode];
+      opt.click();
+      await wait(900);
+    }
+
+    // 5. If custom + text → set input + Enter (validated commit pattern s552)
+    if (mode === 'custom' && typeof item.altCustomText === 'string') {
+      var input = document.querySelector('[data-automation-id="AltTextPluginInput"]');
+      if (!input) return 'AltTextPluginInput not found (custom mode requires input present)';
+      input.focus();
+      await wait(200);
+      var proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(input, item.altCustomText);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(300);
+      // Enter key sequence — required to commit Redux (blur seul ne suffit pas pour Component instance children)
+      input.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+      }));
+      input.dispatchEvent(new KeyboardEvent('keypress', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+      }));
+      input.dispatchEvent(new KeyboardEvent('keyup', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+      }));
+      await wait(500);
+      input.blur();
+      await wait(waitMs);
+    }
+
+    return null; // success
+  }
+
+  p._localCmd.helpEditImagesAltInComponent = async function(args) {
+    args = args || {};
+    var items = args.items || [];
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 600;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return { ok: false, error: 'items array required (non-empty)' };
+    }
+
+    var start = Date.now();
+    var applied = [];
+    var failed = [];
+
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item.nodeId) {
+        failed.push({ index: i, reason: 'nodeId required' });
+        continue;
+      }
+      var err = await applyOne(item, waitMs);
+      if (err) {
+        failed.push({ index: i, nodeId: item.nodeId, reason: err });
+      } else {
+        applied.push({
+          nodeId: item.nodeId,
+          altMode: item.altMode || 'inherit',
+          altCustomText: item.altCustomText || null
+        });
+      }
+    }
+
+    return {
+      ok: failed.length === 0,
+      total: items.length,
+      applied_count: applied.length,
+      failed_count: failed.length,
+      applied: applied,
+      failed: failed,
+      durationMs: Date.now() - start
+    };
+  };
+
+  console.log('[HelpEditImagesAltInComponent] 1 command registered: helpEditImagesAltInComponent (batch alt edit inside Component view — v3.11.0)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -2819,6 +2997,7 @@
     'renameNode',
     'setComponentPropsViaUI',
     'setImageSettings',
+    'helpEditImagesAltInComponent',
     'findNodeContext',
     'listEmbeds',
     'getEmbedContent',
