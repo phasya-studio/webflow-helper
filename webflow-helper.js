@@ -38,6 +38,15 @@
  *      → menu apparaît avec data-automation-id="component-property-reset" → click.
  *      Permet de re-mettre une instance à son default sans valeur arbitraire.
  *
+ * MINOR v3.9.0 (s551) : dumpTree `resolveCombo` — élimine besoin de
+ * `mcp__webflow__element_tool.query_elements` pour résolution des combo classes.
+ * Quand `resolveCombo: true`, chaque entry inclut `classesResolved: [{id, name,
+ * isCombo, parentId?, parentName?}]` à côté du tableau `classes` (plain names
+ * pour back-compat). Résolu via `StyleBlockStore.parentIndex` (221 mappings AVG).
+ * Validé empirique : 100% cohérence avec snapshot offline `project/webflow-state/
+ * styles.json`. ~1ms overhead par node. Pair avec hook BLOCK `query_elements`
+ * qui force dumpTree comme voie par défaut pour toutes inspections runtime.
+ *
  * MINOR v3.6.0 (s550) : dumpTree `includeParent` default `true` (était `false`). Le
  * `parent_id` est désormais ajouté à chaque entry par défaut — résout le bug walker
  * "depth non fiable comme borne de subtree" (artefact Symbol expand). Consommateurs
@@ -87,7 +96,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.8.0';
+  var VERSION = '3.9.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -1554,22 +1563,46 @@
   }
 
   /**
-   * Build a tree entry from a node + depth + context (sbs, opts).
+   * Build a tree entry from a node + depth + context (sbs, opts, parentIndex).
    * Pure function — no side effects.
+   *
+   * v3.9.0 (s551) — if opts.resolveCombo, also builds `classesResolved` array
+   * of `{id, name, isCombo, parentName}` enriched entries alongside the plain
+   * `classes` (preserved for back-compat). isCombo derived from parentIndex
+   * presence (combo classes have an entry mapping their styleBlockId → parent
+   * styleBlockId in StyleBlockStore.parentIndex).
    */
-  function buildEntry(node, depth, sbs, opts) {
+  function buildEntry(node, depth, sbs, opts, parentIndex) {
     var type = node.get && node.get('type');
     var id = node.get && node.get('id');
     var data = node.get && node.get('data');
     var tag = (data && data.get) ? (data.get('tag') || null) : null;
 
-    // classes
+    // classes (plain names) — preserved for back-compat
     var classes = [];
+    var classesResolved = null;
     try {
       var sbIds = data && data.get && data.get('styleBlockIds');
       var arr = sbIds && sbIds.toJS ? sbIds.toJS() : (Array.isArray(sbIds) ? sbIds : []);
       classes = arr.map(function(s) { return (sbs && sbs[s] && sbs[s].name) || s; });
-    } catch (e) { classes = []; }
+      // v3.9.0 — resolveCombo enrichment
+      if (opts.resolveCombo) {
+        classesResolved = arr.map(function(s) {
+          var block = sbs && sbs[s];
+          var entry = { id: s, name: (block && block.name) || s };
+          var parentId = parentIndex && parentIndex[s];
+          if (parentId) {
+            entry.isCombo = true;
+            entry.parentId = parentId;
+            var parentBlock = sbs && sbs[parentId];
+            if (parentBlock) entry.parentName = parentBlock.name;
+          } else {
+            entry.isCombo = false;
+          }
+          return entry;
+        });
+      }
+    } catch (e) { classes = []; classesResolved = null; }
 
     // attr
     var attr = null;
@@ -1624,8 +1657,10 @@
     var entry;
     if (opts.compact) {
       entry = { d: depth, type: type, classes: classes };
+      if (classesResolved) entry.classesResolved = classesResolved;
     } else {
       entry = { depth: depth, type: type, tag: tag, id: id, classes: classes };
+      if (classesResolved) entry.classesResolved = classesResolved;
       if (attr) entry.attr = attr;
       if (xattr) entry.xattr = xattr;
       if (text) entry.text = text;
@@ -1657,6 +1692,7 @@
    * @param {boolean} [args.expandSlotOverrides=false] v3.3.0 — Reveal ComponentInstance children nested in slot overrides. When a Symbol instance has `data.sym.overrides[slotPropId]` = array of nodes (typical for slots like `faq_list` in a Section FAQ component), walks those nodes as virtual children with `fromSlotOverride: true`, `slotPropId`, `slotIndex`. Extracts each child's own prop overrides into a `propOverrides: {propId: value}` map (text format `[{data:{value}}]` flattened to string; link/bool kept raw). Read-only. Result includes `slot_overrides: <count>`.
    * @param {string}  [args.rootId]            v1.6.0 — Scope walk to subtree rooted at this node ID (default: body root). Reduces payload 5-10× when working in a known subsection. Returns error if ID not found.
    * @param {boolean} [args.includeParent=true] v3.6.0 — Default true (était false v1.6.0). Adds `parent_id` field to each entry (computed via depth-based stack during walk). Replaces the JS-side `findIndex + walk back` pattern. Only set when not compact. Skipped on virtual nodes from expandComponents. Universal usage: walker générique pour identifier section + variant d'une Image en remontant la chaîne d'ancêtres (au lieu de slice-par-depth qui est cassé par les Symbol expand).
+   * @param {boolean} [args.resolveCombo=false] v3.9.0 (s551) — Enrich each entry with `classesResolved: [{id, name, isCombo, parentId?, parentName?}]` alongside the plain `classes` array. Resolves combo classes (10% of names are homonyms in template Phasya, but styleBlockIds are unique). Uses StyleBlockStore.parentIndex (~221 mappings) for O(1) lookup per class. Eliminates the need for MCP `query_elements` style_ids round-trip. ~1ms overhead per node.
    * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, hint?: string, scoped_to?: string, error?: string }}
    *
    * v1.6.0 hint heuristics: when count===0, the response includes a `hint` field describing the most likely cause (low maxDepth, page not loaded, class spelling, text on non-text-bearing nodes). Empty hint = filter just doesn't match anything.
@@ -1742,11 +1778,13 @@
     var expandSlotOverrides = args.expandSlotOverrides === true; // v3.3.0
     var rootIdScope = args.rootId || null;          // v1.6.0
     var includeParent = args.includeParent !== false; // v3.6.0 — default true (était === true en v1.6.0)
+    var resolveCombo = args.resolveCombo === true;   // v3.9.0 — enrich classesResolved
     var entryOpts = {
       compact: compact,
       includeText: args.includeText !== false && !compact,
       includeAttr: args.includeAttr !== false && !compact,
-      includeXattr: args.includeXattr !== false && !compact
+      includeXattr: args.includeXattr !== false && !compact,
+      resolveCombo: resolveCombo
     };
 
     // v1.6.0 — root scoping
@@ -1761,14 +1799,20 @@
 
     // Resolve styleBlocks once for the entire walk.
     var sbs = null;
+    var parentIndex = null; // v3.9.0
     try {
       var state = helpers.getReduxState();
       var sbStore = state && state.StyleBlockStore;
       if (sbStore && sbStore.get) {
         var blocks = sbStore.get('styleBlocks');
         sbs = blocks && blocks.toJS ? blocks.toJS() : blocks;
+        // v3.9.0 — parentIndex pour résolution combo (Map<comboId, parentId>)
+        if (resolveCombo) {
+          var pi = sbStore.get('parentIndex');
+          parentIndex = pi && pi.toJS ? pi.toJS() : pi;
+        }
       }
-    } catch (e) { sbs = null; }
+    } catch (e) { sbs = null; parentIndex = null; }
 
     // Pre-walk: index template roots (data.sym.root === true) by node id.
     // Templates live at depth 1 of root in Webflow's flat AbstractNodeStore.
@@ -1815,7 +1859,7 @@
         parentStack.pop();
       }
 
-      var built = buildEntry(node, depth, sbs, entryOpts);
+      var built = buildEntry(node, depth, sbs, entryOpts, parentIndex);
 
       // hideTemplateRoots: skip nodes that are template roots at the natural depth 1
       if (hideTemplateRoots && expandComponents && depth === 1 && built.symInfo && built.symInfo.root === true) {
@@ -1852,7 +1896,7 @@
               // Recursive walk of template subtree, with depth offset = symbol.depth + 1
               helpers.walkTree(childNode, function(tNode, tDepth) {
                 expandedCount++;
-                var tBuilt = buildEntry(tNode, depth + 1 + tDepth, sbs, entryOpts);
+                var tBuilt = buildEntry(tNode, depth + 1 + tDepth, sbs, entryOpts, parentIndex);
                 if (!compact) {
                   tBuilt.entry.fromTemplate = built.symInfo.inst;
                   if (built.symInfo.name) tBuilt.entry.fromComponent = built.symInfo.name;
