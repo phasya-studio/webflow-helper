@@ -1,4 +1,4 @@
-/* Webflow Helper v3.10.0 - 2026-05-13 */
+/* Webflow Helper v3.13.0 - 2026-05-16 */
 
 /**
  * Webflow Helper — minimal surface, exposes 11 cmds via `__webflowHelper.run()`:
@@ -17,6 +17,17 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * PATCH v3.13.0 (s557) : setImageSettings — Enter key sequence ajoutée dans applyAlt
+ * pour mode='custom' avec altCustomText. v3.7.0 disposait setter React + input + change
+ * + blur → texte visible UI MAIS Redux NON-COMMITÉ (alt restait `<inherit>` ou vide
+ * en Redux state, malgré retour cmd `applied: ["alt:custom (custom text set)"]`).
+ * Pattern repris de helpEditImagesAltInComponent v3.11.0 (validé s552) :
+ *   focus → setter.call → input event → Enter keydown/keypress/keyup → blur
+ * Validé empirique s557 : 8 zones AVG carte zone livraison alt custom per-zone
+ * (autour de Vernon — service à [Évreux/Rouen/Louviers/...]) → tous propagés Redux
+ * + DOM HTML staging post-publish + cache buster. Bug détecté pendant audit content
+ * /content-audit louviers item 4 (alt carte zone livraison per-zone).
  *
  * MINOR v3.10.0 (s549) : updateEmbedViaUI — fingerprint fallback resolution.
  * Quand embedId ne trouve aucun match dans le canvas DOM (ID volatile : Webflow
@@ -108,7 +119,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.12.0';
+  var VERSION = '3.13.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2712,15 +2723,24 @@
       await wait(waitMs);
     }
 
-    // Custom mode + text → set value via React nativeInputValueSetter
+    // Custom mode + text → set value via React nativeInputValueSetter + Enter commit (v3.13.0 fix)
+    // v3.7.0 disposait setter + input + change + blur → texte visible UI mais Redux NON-COMMITÉ.
+    // Pattern Enter key séquence repris de helpEditImagesAltInComponent v3.11.0 (validé s552).
     if (altMode === 'custom' && typeof customText === 'string') {
       var input = document.querySelector('[data-automation-id="AltTextPluginInput"]');
       if (!input) return 'AltTextPluginInput not found (custom mode requires input present)';
+      input.focus();
+      await wait(200);
       var proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
       setter.call(input, customText);
       input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      await wait(300);
+      // Enter key sequence — required to commit Redux (v3.13.0 fix · v3.7.0 blur seul insuffisant)
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      await wait(500);
       input.blur();
       await wait(waitMs);
     }
