@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.6 - 2026-05-20 */
+/* Webflow Helper v3.20.7 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,13 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.7';
+  var VERSION = '3.20.8';
+  // [v3.20.8 (s568)] 2 fixes empiriques :
+  // (1) Regex validation lowercase strict : `[a-z0-9_-]+` au lieu de `[a-zA-Z0-9_-]+` qui
+  //     laissait passer majuscules. Convention Phasya. Affecte addClassViaUI + renameClassViaUI.
+  // (2) Helper closeChipMenu() — ESC/re-click indicator/click chip ne ferment PAS le menu.
+  //     Validé empirique : click sur zone neutre du StylePanel (bas du panel) ferme menu SANS
+  //     désélectionner l'élément. Utilisé dans removeClassFromElementViaUI case disabled.
   // [v3.20.7 (s568)] Fix critical : React `onMouseEnter` peut être listé dans Object.keys()
   // MAIS valeur undefined sur certains chip state (combo chain) → react_props_inaccessible.
   // Solution : helper `triggerChipHover(chip)` qui tente React puis fallback DOM hover cascade
@@ -3864,6 +3870,20 @@
     return 'dom_fallback';
   }
 
+  // Helper: close chip menu (Rename/Duplicate/Remove options) SANS désélectionner l'élément.
+  // FIX v3.20.8 : ESC, re-click indicator, click chip, click canvas body — TOUS ne marchent PAS
+  // pour fermer proprement le menu. Solution validée empirique : click sur zone neutre du
+  // StylePanel (bas du panel, hors widgets interactifs) via elementFromPoint.
+  async function closeChipMenu() {
+    var stylePanel = document.querySelector('[data-automation-id="StylePanel"]');
+    if (!stylePanel) return;
+    var r = stylePanel.getBoundingClientRect();
+    var elAtPoint = document.elementFromPoint(r.left + r.width / 2, r.bottom - 50);
+    if (elAtPoint && typeof elAtPoint.click === 'function') {
+      elAtPoint.click();
+    }
+  }
+
   // Helper: capture les chips de classes actuellement attachées (exclut le chip BP-icon vide)
   function getCurrentChips() {
     var wrappers = Array.from(document.querySelectorAll('[data-automation-id="selector-widget"] [data-automation-id="style-rule-token-wrapper"]'));
@@ -3939,9 +3959,9 @@
     if (!className || typeof className !== 'string') {
       return { ok: false, error: 'className_required', got: typeof className };
     }
-    if (!/^[a-zA-Z0-9_-]+$/.test(className)) {
+    if (!/^[a-z0-9_-]+$/.test(className)) {
       return { ok: false, error: 'invalid_class_name',
-               message: 'className must match /^[a-zA-Z0-9_-]+$/ (canon §cluster-create-style gotcha #17)',
+               message: 'className must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya · canon §cluster-create-style gotcha #17). Pas de majuscules, espaces, accents.',
                className: className };
     }
 
@@ -4079,8 +4099,8 @@
     // Si chip a un combo enfant derrière (ex: _t1-base-x suivi de _t1-shared), Remove est grisé.
     // Marqueurs disabled : hasAttribute('disabled') · pointer-events:none · opacity:0.6.
     if (removeOpt.hasAttribute('disabled') || getComputedStyle(removeOpt).pointerEvents === 'none') {
-      // Close menu via ESC
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      // Close menu via StylePanel neutral zone click (preserves selection)
+      await closeChipMenu();
       await wait(300);
       return {
         ok: false,
@@ -4139,9 +4159,10 @@
     var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 800;
 
     if (!oldName || !newName) return { ok: false, error: 'oldName_and_newName_required' };
-    if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+    if (!/^[a-z0-9_-]+$/.test(newName)) {
       return { ok: false, error: 'invalid_new_name',
-               message: 'newName must match /^[a-zA-Z0-9_-]+$/', newName: newName };
+               message: 'newName must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya). Pas de majuscules, espaces, accents.',
+               newName: newName };
     }
     if (oldName === newName) return { ok: false, error: 'no_op_same_name' };
 
