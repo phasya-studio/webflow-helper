@@ -1,4 +1,4 @@
-/* Webflow Helper v3.14.2 - 2026-05-20 */
+/* Webflow Helper v3.14.3 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -14,14 +14,14 @@
  * 9. findNodeContext — resolve nodeId → MCP id format + component view context (v3.8.0)
  * 10. listEmbeds — list embeds + their contents (no MCP tool)
  * 11. getEmbedContent — fast Redux read of a single embed's content (no MCP tool · may be stale after writes on inComponent — see getEmbedContentViaUI)
- * 12. getEmbedContentViaUI — ground-truth read via CodeMirror UI scrape (~3-4s · 100% reliable post-write inComponent) (v3.14.2)
+ * 12. getEmbedContentViaUI — ground-truth read via CodeMirror UI scrape (~3-4s · 100% reliable post-write inComponent) (v3.14.3)
  * 13. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
  * 14. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
  *
- * PATCH v3.14.2 (s567) : updateEmbedViaUI — verify post-save Redux REMPLACÉE par
+ * PATCH v3.14.3 (s567) : updateEmbedViaUI — verify post-save Redux REMPLACÉE par
  * verify CodeMirror pré-save (ground truth instant). Le Redux store local n'est PAS
  * resync après save UI sur embed inComponent (validé empirique : 3 retries × 6.5s sur
  * services 998737ec retournaient `success:false` faux négatif alors que server avait
@@ -134,7 +134,13 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.14.2';
+  var VERSION = '3.14.3';
+  // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
+  // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
+  // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
+  // .cm-line walk DOM (bug virtualisation : pour embed 17K chars / 472 lignes, le
+  // walk ne lit que 66 lignes vs 473 réelles). EditorView API = ground truth instant,
+  // 100% complet quelle que soit la taille, no scroll forcing needed.
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -621,7 +627,7 @@
   /**
    * List all HtmlEmbeds in the page tree (FAST · Redux walk).
    *
-   * ⚠️ STALE WARNING (v3.14.2) : Returned `length` and `preview` come from local
+   * ⚠️ STALE WARNING (v3.14.3) : Returned `length` and `preview` come from local
    * AbstractNodeStore Redux which is NOT auto-resynced after a successful
    * `updateEmbedViaUI` on an inComponent embed — only Designer reload F5 refreshes
    * it. For embeds you've just written in-session, use `getEmbedContentViaUI`
@@ -658,7 +664,7 @@
   /**
    * Read the full content of an embed (FAST · Redux read).
    *
-   * ⚠️ STALE WARNING (v3.14.2) : The returned `value` comes from local
+   * ⚠️ STALE WARNING (v3.14.3) : The returned `value` comes from local
    * AbstractNodeStore Redux which is NOT auto-resynced after a successful
    * `updateEmbedViaUI` on an inComponent embed. The save IS committed server-side
    * (verified empirically via curl staging post-publish) but the local Redux only
@@ -686,17 +692,18 @@
   /**
    * Read the full content of an embed via UI scrape (SLOW · 100% reliable · ground truth).
    *
-   * Workflow (~3-4s, ~4-5s for inComponent):
+   * Workflow (~3-4s native, ~4-5s for inComponent):
    *   1. Deselect (canvas body.click)
    *   2. If embed is nested in Component → double-click instance to enter component view
    *   3. Click embed in canvas (data-w-id native, or data-wf-id*= for component-nested)
    *   4. Click "Settings" tab
    *   5. Click "Open Code Editor" button
-   *   6. Force full doc render (scroll bottom → top to defeat CodeMirror virtualization)
-   *   7. Read .cm-line children textContent (joined by \n) — this is exactly what
-   *      Webflow stores server-side
-   *   8. Click modal close X (read-only, no Save → no "unsaved" prompt)
-   *   9. Exit component view if entered
+   *   6. Read content via OFFICIAL CodeMirror v6 EditorView API :
+   *      `cmContent.cmTile.view.state.doc.toString()` — bypasses DOM virtualization
+   *      (the alternative .cm-line walk would miss virtualized lines for embeds >~3K chars).
+   *      This is exactly what Webflow stores server-side.
+   *   7. Click modal close X (read-only, no Save → no "unsaved" prompt)
+   *   8. Exit component view if entered
    *
    * Use this instead of `getEmbedContent` when :
    *   - You just called `updateEmbedViaUI` on an inComponent embed and need to
@@ -724,7 +731,6 @@
       afterSelect: waitMs.afterSelect || 500,
       afterSettingsTab: waitMs.afterSettingsTab || 500,
       afterOpenEditor: waitMs.afterOpenEditor || 800,
-      afterScrollRender: waitMs.afterScrollRender || 150,
       afterClose: waitMs.afterClose || 300,
       afterExitComponent: waitMs.afterExitComponent || 250
     };
@@ -747,10 +753,10 @@
       embedEl = canvasDoc.querySelector('[data-wf-id*="' + embedId + '"]');
       if (!embedEl) return { ok: false, error: 'embed not found in canvas DOM', embedId: embedId };
       try {
-        var path = JSON.parse(embedEl.getAttribute('data-wf-id') || '[]');
-        if (Array.isArray(path) && path.length > 1) {
+        var pathArr = JSON.parse(embedEl.getAttribute('data-wf-id') || '[]');
+        if (Array.isArray(pathArr) && pathArr.length > 1) {
           isInComponent = true;
-          componentInstanceId = path[0];
+          componentInstanceId = pathArr[0];
         }
       } catch(e) {}
     }
@@ -819,22 +825,19 @@
       openBtn.click();
       await wait(DELAYS.afterOpenEditor);
 
-      // STEP 6: Force full doc render — scroll bottom then top to defeat CodeMirror virtualization
+      // STEP 6: Read CodeMirror content via OFFICIAL CodeMirror v6 EditorView API
+      // (cmContent.cmTile.view.state.doc.toString() — bypasses DOM virtualization entirely).
+      // .cm-line walk would miss virtualized lines for large embeds (>~3K chars).
       var cmContent = document.querySelector('.cm-content');
       if (!cmContent) return { ok: false, error: 'CodeMirror .cm-content not present (modal did not mount?)' };
-      var scroller = document.querySelector('.cm-scroller');
-      if (scroller) {
-        scroller.scrollTop = scroller.scrollHeight;
-        await wait(80);
-        scroller.scrollTop = 0;
-        await wait(DELAYS.afterScrollRender);
+      var cmTile = cmContent.cmTile;
+      if (!cmTile || !cmTile.view || !cmTile.view.state || !cmTile.view.state.doc) {
+        return { ok: false, error: 'CodeMirror EditorView/state.doc not accessible via cmContent.cmTile.view' };
       }
+      var cmText = cmTile.view.state.doc.toString();
+      var lineCount = cmTile.view.state.doc.lines;
 
-      // STEP 7: Read CodeMirror content — ground truth
-      var cmLines = cmContent.querySelectorAll('.cm-line');
-      var cmText = Array.prototype.map.call(cmLines, function(l) { return l.textContent; }).join('\n');
-
-      // STEP 8: Close modal (read-only — no Save, no dirty state, no prompt)
+      // STEP 7: Close modal (read-only — no Save, no dirty state, no prompt)
       var closeBtn = document.querySelector('[data-automation-id="modal-close-button"]');
       if (closeBtn) {
         closeBtn.click();
@@ -844,7 +847,7 @@
       }
       await wait(DELAYS.afterClose);
 
-      // STEP 9: Exit component view if entered
+      // STEP 8: Exit component view if entered
       if (isInComponent) {
         canvasDoc.body.click();
         await wait(DELAYS.afterExitComponent);
@@ -855,11 +858,11 @@
         id: embedId,
         value: cmText,
         length: cmText.length,
-        lines_read: cmLines.length,
+        line_count: lineCount,
         inComponent: isInComponent,
         componentInstanceId: componentInstanceId,
         durationMs: Date.now() - start,
-        source: 'codemirror_ui_scrape'
+        source: 'codemirror_editorview_api'
       };
     } catch (e) {
       return {
@@ -883,7 +886,7 @@
    *   4. Click "Settings" tab (if Style tab is active)
    *   5. Click "Open Code Editor" button (data-automation-id="OpenCodeEditor")
    *   6. Focus .cm-content (CodeMirror v6), selectAll, dispatch paste event with new content
-   *   6.5 [v3.14.2] Verify paste via CodeMirror .cm-line walk (ground truth — what
+   *   6.5 [v3.14.3] Verify paste via CodeMirror .cm-line walk (ground truth — what
    *       gets sent to server). Replaces post-save Redux read which was unreliable
    *       for inComponent embeds (store not auto-resynced).
    *   7. Click "Save & Close" button
@@ -1070,14 +1073,27 @@
     cmContent.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
     await wait(DELAYS.afterPaste);
 
-    // STEP 6.5 [v3.14.2]: PRE-SAVE GROUND TRUTH VERIFY via CodeMirror DOM scrape
+    // STEP 6.5 [v3.14.3]: PRE-SAVE GROUND TRUTH VERIFY via CodeMirror EditorView API
     // Le Redux store local n'est PAS resync après save UI sur embed inComponent
     // (validé empirique : actualLength reste = ancien content dans Redux malgré save serveur réussi).
     // → on vérifie que le paste a bien atterri dans CodeMirror AVANT de cliquer Save & Close.
+    // Lecture via `cmContent.cmTile.view.state.doc.toString()` = API officielle CodeMirror v6,
+    // bypasses DOM virtualization (le .cm-line walk manque les lignes virtualisées pour embeds >~3K).
     // CodeMirror est exactement ce que Webflow va envoyer au server → ground truth fiable.
-    // Tolérance ±2 chars pour le trailing \n stripping CodeMirror v6.
-    var cmLinesPostPaste = cmContent.querySelectorAll('.cm-line');
-    var cmTextPostPaste = Array.prototype.map.call(cmLinesPostPaste, function(l) { return l.textContent; }).join('\n');
+    // Tolérance ±2 chars pour le trailing `\n` strip CodeMirror.
+    var cmTilePostPaste = cmContent.cmTile;
+    if (!cmTilePostPaste || !cmTilePostPaste.view || !cmTilePostPaste.view.state || !cmTilePostPaste.view.state.doc) {
+      return {
+        ok: false,
+        success: false,
+        embedId: embedId,
+        error: 'CodeMirror EditorView/state.doc not accessible via cmContent.cmTile.view (paste verify impossible)',
+        inComponent: isInComponent,
+        componentInstanceId: componentInstanceId,
+        durationMs: Date.now() - start
+      };
+    }
+    var cmTextPostPaste = cmTilePostPaste.view.state.doc.toString();
     var pasteVerifyOk = (cmTextPostPaste.length === content.length) || (Math.abs(cmTextPostPaste.length - content.length) <= 2);
     if (!pasteVerifyOk) {
       return {
@@ -1109,7 +1125,7 @@
       await wait(DELAYS.afterExitComponent);
     }
 
-    // [v3.14.2] Success based on STEP 6.5 pre-save CodeMirror verify (ground truth).
+    // [v3.14.3] Success based on STEP 6.5 pre-save CodeMirror verify (ground truth).
     // Redux post-save read is unreliable on inComponent (canon §gotcha-redux-stale-inComponent).
     // For guaranteed-fresh re-read post-save, caller can use `getEmbedContentViaUI`.
     var result = {
