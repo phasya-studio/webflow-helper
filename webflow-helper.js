@@ -134,7 +134,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.15.0';
+  var VERSION = '3.16.0';
   // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
   // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
   // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
@@ -2011,6 +2011,9 @@
     if (opts.compact) {
       entry = { d: depth, type: type, classes: classes };
       if (classesResolved) entry.classesResolved = classesResolved;
+      // v3.16.0 fix : si text extrait (forcé par filterText), le rendre visible
+      // dans l'entry compact aussi — permet d'identifier le match sans deuxième call.
+      if (text) entry.text = text;
     } else {
       entry = { depth: depth, type: type, tag: tag, id: id, classes: classes };
       if (classesResolved) entry.classesResolved = classesResolved;
@@ -2132,9 +2135,12 @@
     var rootIdScope = args.rootId || null;          // v1.6.0
     var includeParent = args.includeParent !== false; // v3.6.0 — default true (était === true en v1.6.0)
     var resolveCombo = args.resolveCombo === true;   // v3.9.0 — enrich classesResolved
+    var includeBreadcrumb = args.includeBreadcrumb === true; // v3.16.0 — chaîne ancêtres
     var entryOpts = {
       compact: compact,
-      includeText: args.includeText !== false && !compact,
+      // v3.16.0 fix : forcer includeText/Attr si un filter sur ce champ est actif,
+      // sinon le filter rejette tout en compact (text=null car non-extracted).
+      includeText: (args.includeText !== false && !compact) || !!filterTextLower,
       includeAttr: args.includeAttr !== false && !compact,
       includeXattr: args.includeXattr !== false && !compact,
       resolveCombo: resolveCombo
@@ -2187,7 +2193,7 @@
     var totalWalked = 0;
     var expandedCount = 0;
     var slotOverridesCount = 0; // v3.3.0
-    var parentStack = []; // v1.6.0 — [{ depth, id }] for includeParent
+    var parentStack = []; // v1.6.0 — [{ depth, id, type?, classFirst? }] for includeParent + includeBreadcrumb v3.16.0
 
     function applyFiltersAndPush(entry, type, classes, text) {
       if (filterType && type !== filterType) return;
@@ -2227,9 +2233,21 @@
         built.entry.parent_id = parentStack[parentStack.length - 1].id;
       }
 
+      // v3.16.0 — breadcrumb computed BEFORE pushing self on stack (= just ancestors)
+      if (includeBreadcrumb && parentStack.length > 0) {
+        built.entry.breadcrumb = parentStack.map(function(p) {
+          return p.classFirst ? p.type + '.' + p.classFirst : (p.type || 'Node');
+        }).join(' > ');
+      }
+
       // Push current node on stack BEFORE filters/expand (children of current node need its id as parent)
       var currentId = node.get && node.get('id');
-      if (currentId) parentStack.push({ depth: depth, id: currentId });
+      if (currentId) parentStack.push({
+        depth: depth,
+        id: currentId,
+        type: built.type,
+        classFirst: (built.classes && built.classes[0]) || null
+      });
 
       applyFiltersAndPush(built.entry, built.type, built.classes, built.text);
 
