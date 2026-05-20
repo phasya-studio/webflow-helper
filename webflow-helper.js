@@ -1,4 +1,4 @@
-/* Webflow Helper v3.19.1 - 2026-05-20 */
+/* Webflow Helper v3.19.2 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.19.2';
+  var VERSION = '3.20.0';
+  // [v3.20.0 (s568)] Add cleanupUnusedStylesViaUI — 6e cmd Style Selector UI : bulk delete
+  // orphelines via Style Manager (raccourci G + Clean up styles button + Delete). Bypass
+  // gotchas #22 + #23 (remove_style refuse attached + parent_style_names cassé). Option
+  // dryRun pour preview liste classes avant suppression. Workflow validé empirique s568.
   // [v3.19.2 (s568)] Doc enrichment : JSDoc renameClassViaUI documente le comportement
   // empirique (standalone global vs combo local · flicker rebuild CSS · props préservation).
   // No code change — versioning bump pour aligner avec canon webflow-helper-canon.md
@@ -4227,7 +4231,141 @@
     };
   };
 
-  console.log('[StyleSelectorUI] 5 commands registered: addClassViaUI · removeLastClassViaUI · removeClassFromElementViaUI · renameClassViaUI · duplicateClassViaUI (v3.19.0 s568)');
+  /**
+   * cleanupUnusedStylesViaUI({dryRun?, waitMs?}) — v3.20.0 (s568)
+   *
+   * Bulk delete TOUTES les classes orphelines (0 usage DOM) du registry via Style Manager UI.
+   * Trigger : raccourci `G` ouvre Style Manager → click "Clean up styles" → modal → click "Delete".
+   *
+   * BYPASS gotchas style_tool MCP :
+   * - #22 (remove_style refuse classe attachée) — N/A car ne touche QUE les non-attachées
+   * - #23 (parent_style_names cassé) — N/A car bulk auto-détecté par Webflow
+   *
+   * SI dryRun=true : parse le modal "The following styles are not associated..." pour preview
+   * la liste classes à supprimer SANS cliquer Delete. Retourne la liste + ferme le modal (ESC).
+   *
+   * SI 0 orphelines : le bouton "Clean up styles" peut ne pas être présent OU le modal vide.
+   * La cmd retourne {ok: true, classes_about_to_delete: []} sans rien faire.
+   *
+   * Pré-requis : pas d'input/contentEditable focused (sinon G typé dedans), pas de modal ouvert.
+   * La cmd enchaîne tree-view-container.click() puis dispatch G keydown pour garantir focus.
+   */
+  p._localCmd.cleanupUnusedStylesViaUI = async function(args) {
+    args = args || {};
+    var dryRun = args.dryRun === true;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 800;
+    var start = Date.now();
+
+    // ESC cleanup état initial
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await wait(300);
+
+    // 1. Focus Navigator (pré-requis pour que G shortcut soit capté)
+    var treeView = document.querySelector('[data-automation-id="tree-view-container"]');
+    if (!treeView) {
+      return { ok: false, error: 'navigator_not_found',
+               message: 'tree-view-container not in DOM — Designer may not be ready' };
+    }
+    treeView.click();
+    await wait(300);
+
+    // 2. Trigger G keydown sur document (shortcut global Webflow)
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'g', code: 'KeyG', keyCode: 71, which: 71,
+      bubbles: true, cancelable: true
+    }));
+    document.dispatchEvent(new KeyboardEvent('keyup', {
+      key: 'g', code: 'KeyG', keyCode: 71, which: 71, bubbles: true
+    }));
+    await wait(700);
+
+    // 3. Vérifier que le Style Manager s'est ouvert
+    var stylesPanel = document.querySelector('[data-automation-id="styles"]');
+    if (!stylesPanel) {
+      return { ok: false, error: 'style_manager_did_not_open',
+               message: 'G shortcut not captured — Navigator may not have focus, or another modal is blocking' };
+    }
+
+    // 4. Click "Clean up styles" button
+    var cleanBtn = document.querySelector('[data-automation-id="clean-up-styles-button"]');
+    if (!cleanBtn) {
+      // Pas de bouton = 0 orphelines OU UI Webflow a changé
+      // Close Style Manager + return
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      return { ok: true, classes_about_to_delete: [],
+               message: 'clean_up_styles_button not present — 0 orphan classes likely',
+               durationMs: Date.now() - start };
+    }
+    cleanBtn.click();
+    await wait(700);
+
+    // 5. Parse le modal "Clean up unused styles" pour la liste classes orphelines
+    var modal = Array.from(document.querySelectorAll('[data-automation-id="overlay"]'))
+      .find(function(el) { return el.offsetWidth > 0 && /The following styles/.test(el.textContent || ''); });
+
+    var classesAboutToDelete = [];
+    if (modal) {
+      // Extract class names from modal content
+      // Format: "The following styles are not associated with any page elements:_test-container_test-box..."
+      var modalText = modal.textContent || '';
+      var afterColon = modalText.split('elements:')[1];
+      if (afterColon) {
+        // Stop at "Delete" or "Cancel" button text
+        var listPart = afterColon.split(/\bDelete\b|\bCancel\b|\bKeep\b/)[0];
+        // Split on capital underscore prefix (heuristic for class boundary)
+        // Better : parse chip wrappers in modal
+        var chipsInModal = modal.querySelectorAll('[data-automation-id="style-rule-token-wrapper"]');
+        classesAboutToDelete = Array.from(chipsInModal)
+          .map(function(c) {
+            var t = c.querySelector('[data-automation-id="style-rule-token-text"]');
+            return t ? t.textContent.trim() : null;
+          })
+          .filter(Boolean);
+        if (classesAboutToDelete.length === 0 && listPart) {
+          // Fallback : just return raw list text
+          classesAboutToDelete = [listPart.trim().slice(0, 500)];
+        }
+      }
+    }
+
+    // 6. Si dryRun : close modal + return preview
+    if (dryRun) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await wait(300);
+      // ESC again to close Style Manager too
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      return {
+        ok: true,
+        dryRun: true,
+        classes_about_to_delete: classesAboutToDelete,
+        count: classesAboutToDelete.length,
+        durationMs: Date.now() - start
+      };
+    }
+
+    // 7. Click "Delete" pour confirmer le bulk
+    var deleteBtn = document.querySelector('[data-automation-id="remove-styles-button"]');
+    if (!deleteBtn) {
+      return { ok: false, error: 'remove_styles_button_not_visible',
+               message: 'Modal opened but Delete button absent — 0 orphans confirmed',
+               classes_about_to_delete: classesAboutToDelete };
+    }
+    deleteBtn.click();
+    await wait(waitMs);
+
+    // 8. Close Style Manager (ESC)
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await wait(200);
+
+    return {
+      ok: true,
+      deleted_count: classesAboutToDelete.length,
+      classes_deleted: classesAboutToDelete,
+      durationMs: Date.now() - start
+    };
+  };
+
+  console.log('[StyleSelectorUI] 6 commands registered: addClassViaUI · removeLastClassViaUI · removeClassFromElementViaUI · renameClassViaUI · duplicateClassViaUI · cleanupUnusedStylesViaUI (v3.20.0 s568)');
 })();
 
 (function filterExposedCmds() {
@@ -4256,7 +4394,8 @@
     'removeLastClassViaUI',
     'removeClassFromElementViaUI',
     'renameClassViaUI',
-    'duplicateClassViaUI'
+    'duplicateClassViaUI',
+    'cleanupUnusedStylesViaUI'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
