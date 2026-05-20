@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.3 - 2026-05-20 */
+/* Webflow Helper v3.20.4 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.4';
+  var VERSION = '3.20.5';
+  // [v3.20.5 (s568)] Hygiène fermeture : cleanupUnusedStylesViaUI track état initial Style Manager
+  // (wasInitiallyOpen) et close via sidebar toggle si la cmd l'a ouvert (sinon laisse comme trouvé).
+  // Helper `closeIfWeOpened()` appelé sur tous les return paths. Best practice : laisser l'état
+  // Designer comme on l'a trouvé pour ne pas perturber le workflow utilisateur.
   // [v3.20.4 (s568)] Fix cleanupUnusedStylesViaUI : pré-check Style Manager état avant
   // click sidebar button. Le button est un TOGGLE — sans pré-check, 2e call consécutif
   // fermait le Style Manager au lieu de l'ouvrir. Maintenant skip le click si déjà ouvert.
@@ -4302,11 +4306,12 @@
       await wait(400);
     }
 
-    // 1. Click sur left-sidebar-styles-button SEULEMENT si Style Manager pas déjà ouvert.
-    // FIX v3.20.4 : le sidebar styles button est un TOGGLE — click ferme si déjà ouvert.
-    // Sans pré-check, le 2e call consécutif fermait le Style Manager au lieu de l'ouvrir.
+    // 1. Track initial state pour hygiène fermeture à la fin (FIX v3.20.5).
     var stylesPanelCheck = document.querySelector('[data-automation-id="styles"]');
-    if (!stylesPanelCheck || stylesPanelCheck.offsetWidth === 0) {
+    var wasInitiallyOpen = !!(stylesPanelCheck && stylesPanelCheck.offsetWidth > 0);
+
+    // 2. Open Style Manager si pas déjà ouvert (TOGGLE — click ferme si déjà ouvert).
+    if (!wasInitiallyOpen) {
       var stylesSidebarBtn = document.querySelector('[data-automation-id="left-sidebar-styles-button"]');
       if (!stylesSidebarBtn) {
         return { ok: false, error: 'styles_sidebar_button_not_found',
@@ -4316,21 +4321,32 @@
       await wait(700);
     }
 
-    // 2. Vérifier que le Style Manager s'est ouvert
+    // 3. Vérifier que le Style Manager est bien ouvert
     var stylesPanel = document.querySelector('[data-automation-id="styles"]');
     if (!stylesPanel) {
       return { ok: false, error: 'style_manager_did_not_open',
-               message: 'Click sidebar button did not open Style Manager — modal may be blocking' };
+               message: 'Style Manager not visible after sidebar click — modal blocking or UI changed' };
+    }
+
+    // Helper: close Style Manager via sidebar toggle (uniquement si on l'a ouvert).
+    // FIX v3.20.5 : hygiène — laisser l'état Designer comme on l'a trouvé.
+    async function closeIfWeOpened() {
+      if (wasInitiallyOpen) return; // Caller had it open, leave it open
+      var btn = document.querySelector('[data-automation-id="left-sidebar-styles-button"]');
+      var stillOpen = document.querySelector('[data-automation-id="styles"]');
+      if (btn && stillOpen && stillOpen.offsetWidth > 0) {
+        btn.click();
+        await wait(400);
+      }
     }
 
     // 4. Click "Clean up styles" button
     var cleanBtn = document.querySelector('[data-automation-id="clean-up-styles-button"]');
     if (!cleanBtn) {
-      // Pas de bouton = 0 orphelines OU UI Webflow a changé
-      // Close Style Manager + return
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      return { ok: true, classes_about_to_delete: [],
-               message: 'clean_up_styles_button not present — 0 orphan classes likely',
+      // Pas de bouton = 0 orphelines (Webflow masque le bouton si rien à cleanup)
+      await closeIfWeOpened();
+      return { ok: true, classes_about_to_delete: [], count: 0,
+               message: 'clean_up_styles_button not present — 0 orphan classes',
                durationMs: Date.now() - start };
     }
     cleanBtn.click();
@@ -4342,15 +4358,10 @@
 
     var classesAboutToDelete = [];
     if (modal) {
-      // Extract class names from modal content
-      // Format: "The following styles are not associated with any page elements:_test-container_test-box..."
       var modalText = modal.textContent || '';
       var afterColon = modalText.split('elements:')[1];
       if (afterColon) {
-        // Stop at "Delete" or "Cancel" button text
         var listPart = afterColon.split(/\bDelete\b|\bCancel\b|\bKeep\b/)[0];
-        // Split on capital underscore prefix (heuristic for class boundary)
-        // Better : parse chip wrappers in modal
         var chipsInModal = modal.querySelectorAll('[data-automation-id="style-rule-token-wrapper"]');
         classesAboutToDelete = Array.from(chipsInModal)
           .map(function(c) {
@@ -4359,18 +4370,17 @@
           })
           .filter(Boolean);
         if (classesAboutToDelete.length === 0 && listPart) {
-          // Fallback : just return raw list text
           classesAboutToDelete = [listPart.trim().slice(0, 500)];
         }
       }
     }
 
-    // 6. Si dryRun : close modal + return preview
+    // 6. Si dryRun : close modal + Style Manager (si on l'a ouvert) + return preview
     if (dryRun) {
+      // Cancel modal via ESC (annule le clean up sans supprimer)
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await wait(300);
-      // ESC again to close Style Manager too
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await wait(400);
+      await closeIfWeOpened();
       return {
         ok: true,
         dryRun: true,
@@ -4383,6 +4393,7 @@
     // 7. Click "Delete" pour confirmer le bulk
     var deleteBtn = document.querySelector('[data-automation-id="remove-styles-button"]');
     if (!deleteBtn) {
+      await closeIfWeOpened();
       return { ok: false, error: 'remove_styles_button_not_visible',
                message: 'Modal opened but Delete button absent — 0 orphans confirmed',
                classes_about_to_delete: classesAboutToDelete };
@@ -4390,9 +4401,8 @@
     deleteBtn.click();
     await wait(waitMs);
 
-    // 8. Close Style Manager (ESC)
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    await wait(200);
+    // 8. Close Style Manager (si on l'a ouvert)
+    await closeIfWeOpened();
 
     return {
       ok: true,
