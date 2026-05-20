@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.7 - 2026-05-20 */
+/* Webflow Helper v3.20.8 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,10 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.8';
+  var VERSION = '3.20.9';
+  // [v3.20.9 (s569)] Opt-in flag `allowLegacyUppercase: true` sur addClassViaUI + renameClassViaUI.
+  // Permet d'attacher/renommer des classes legacy Phasya en uppercase (BodyM-500, BodyXL-500, etc.)
+  // existant au registry. Par défaut lowercase strict reste appliqué (convention).
   // [v3.20.8 (s568)] 2 fixes empiriques :
   // (1) Regex validation lowercase strict : `[a-z0-9_-]+` au lieu de `[a-zA-Z0-9_-]+` qui
   //     laissait passer majuscules. Convention Phasya. Affecte addClassViaUI + renameClassViaUI.
@@ -3959,9 +3962,13 @@
     if (!className || typeof className !== 'string') {
       return { ok: false, error: 'className_required', got: typeof className };
     }
-    if (!/^[a-z0-9_-]+$/.test(className)) {
+    var allowUpper = args.allowLegacyUppercase === true;
+    var classNameRegex = allowUpper ? /^[a-zA-Z0-9_-]+$/ : /^[a-z0-9_-]+$/;
+    if (!classNameRegex.test(className)) {
       return { ok: false, error: 'invalid_class_name',
-               message: 'className must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya · canon §cluster-create-style gotcha #17). Pas de majuscules, espaces, accents.',
+               message: allowUpper
+                 ? 'className must match /^[a-zA-Z0-9_-]+$/ (allowLegacyUppercase opt-in). Pas d\'espaces, accents, chars spéciaux.'
+                 : 'className must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya · canon §cluster-create-style gotcha #17). Pour classes legacy Phasya uppercase, passer { allowLegacyUppercase: true }.',
                className: className };
     }
 
@@ -4159,9 +4166,13 @@
     var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 800;
 
     if (!oldName || !newName) return { ok: false, error: 'oldName_and_newName_required' };
-    if (!/^[a-z0-9_-]+$/.test(newName)) {
+    var allowUpperR = args.allowLegacyUppercase === true;
+    var newNameRegex = allowUpperR ? /^[a-zA-Z0-9_-]+$/ : /^[a-z0-9_-]+$/;
+    if (!newNameRegex.test(newName)) {
       return { ok: false, error: 'invalid_new_name',
-               message: 'newName must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya). Pas de majuscules, espaces, accents.',
+               message: allowUpperR
+                 ? 'newName must match /^[a-zA-Z0-9_-]+$/ (allowLegacyUppercase opt-in). Pas d\'espaces, accents, chars spéciaux.'
+                 : 'newName must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya). Pour classes legacy Phasya uppercase, passer { allowLegacyUppercase: true }.',
                newName: newName };
     }
     if (oldName === newName) return { ok: false, error: 'no_op_same_name' };
