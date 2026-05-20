@@ -119,7 +119,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.14.0';
+  var VERSION = '3.14.1';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2112,12 +2112,12 @@
    * useState hook for {x, y} and calling its dispatch directly.
    *
    * @param {string|object} position - 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}
-   * @param {number} [margin=16] - Pixels from the corner (ignored when position is {x, y})
+   * @param {number} [margin=0] - Pixels from the corner (ignored when position is {x, y})
    * @returns {object} {ok, before?, target?, bounds?, error?}
    * @private
    */
   function setBridgeWindowPosition(position, margin) {
-    margin = typeof margin === 'number' ? margin : 16;
+    margin = typeof margin === 'number' ? margin : 0;
     var iframe = document.querySelector('iframe[src*="webflow-ext.com"]');
     if (!iframe) return { ok: false, error: 'iframe_not_found' };
 
@@ -2206,7 +2206,7 @@
    * @param {string|object} [args.position] Optional repositioning after mount.
    *   Accepts: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}.
    *   If omitted, keeps React-Draggable's default position.
-   * @param {number}  [args.position_margin=16] Pixels from corner when position is a string.
+   * @param {number}  [args.position_margin=0] Pixels from corner when position is a string.
    * @returns {Promise<object>}
    */
   p._localCmd.launchBridgeApp = async function(args) {
@@ -2217,7 +2217,7 @@
     // Default minimized = true (the open Bridge App window covers the canvas).
     var minimized = args.minimized !== false;
     var requestedPosition = args.position; // undefined = no positioning
-    var positionMargin = typeof args.position_margin === 'number' ? args.position_margin : 16;
+    var positionMargin = typeof args.position_margin === 'number' ? args.position_margin : 0;
 
     // Idempotent: if Bridge is already active, return immediately (option: minimize anyway).
     if (isBridgeIframePresent()) {
