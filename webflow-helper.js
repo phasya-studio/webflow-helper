@@ -1,4 +1,4 @@
-/* Webflow Helper v3.16.0 - 2026-05-20 */
+/* Webflow Helper v3.17.0 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,16 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.17.0';
+  var VERSION = '3.18.0';
+  // [v3.18.0 (s568)] Style Selector UI actions (4 cmds) : addClassViaUI, removeLastClassViaUI,
+  // removeClassFromElementViaUI, renameClassViaUI. Bypass 5 gotchas style_tool MCP
+  // (#5 style_ids non supporté · #15 set_style enrichit silencieusement · #20 parent_style_names
+  // ne disambigue pas combos même nom · #22 remove_style refuse classe attachée · #23 idem).
+  // Pattern critique : React props onMouseEnter pour hover synthétique + element.click() natif
+  // sur menu indicator (dispatchEvent click est intercepté par overlays). dispatchEvent
+  // KeyboardEvent marche sur INPUT (input add/remove) mais PAS sur contentEditable span
+  // (rename via execCommand insertText + InputEvent fallback). Workflows complets validés
+  // empirique session s568 Sandbox AVG. Detail : webflow-helper-canon.md §style-selector-ui-actions.
   // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
   // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
   // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
@@ -3760,6 +3769,343 @@
   console.log('[ScrollToElement] 1 command registered: scrollToElement (canvas iframe scroll — v3.15.0)');
 })();
 
+/**
+ * Style Selector UI actions — 4 cmds : add / removeLast / removeFromElement / rename (s568 v3.18.0)
+ *
+ * Voie d'action programmatique sur le Style Selector Webflow Designer (panel droit) pour
+ * bypass 5 gotchas style_tool MCP (#5/#15/#20/#22/#23).
+ *
+ * REQUIS : un élément doit être sélectionné dans le Designer (via mcp__webflow__element_tool
+ * select_element). Les cmds opèrent sur le state du Style panel pour cet élément actif.
+ *
+ * GOTCHA dispatchEvent : sur INPUT (css-token-input) → KeyboardEvent synthétique fonctionne.
+ *                       sur SPAN contentEditable (chip editable) → KeyboardEvent IGNORÉ par
+ *                       React → renameClassViaUI use execCommand insertText + InputEvent fallback.
+ *
+ * GOTCHA menu chip indicator : dispatchEvent click intercepté par overlays Relume/autres.
+ *                              Use element.click() NATIF après React onMouseEnter (mount conditionnel).
+ *
+ * Detail complet : docs/lessons/webflow-helper-canon.md §style-selector-ui-actions
+ */
+(function() {
+  'use strict';
+
+  if (!window.__webflowHelper) return;
+  var p = window.__webflowHelper;
+  if (!p._localCmd) p._localCmd = {};
+
+  function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  // Helper: capture les chips de classes actuellement attachées (exclut le chip BP-icon vide)
+  function getCurrentChips() {
+    var wrappers = Array.from(document.querySelectorAll('[data-automation-id="selector-widget"] [data-automation-id="style-rule-token-wrapper"]'));
+    return wrappers.map(function(w) {
+      var textEl = w.querySelector('[data-automation-id="style-rule-token-text"], [data-automation-id="style-rule-token-text-editable"]');
+      return textEl ? textEl.textContent.trim() : '';
+    }).filter(function(t) { return t.length > 0; });
+  }
+
+  // Helper: find chip wrapper containing exact class name (passive state)
+  function findChipByName(name) {
+    var wrappers = Array.from(document.querySelectorAll('[data-automation-id="selector-widget"] [data-automation-id="style-rule-token-wrapper"]'));
+    return wrappers.find(function(w) {
+      var t = w.querySelector('[data-automation-id="style-rule-token-text"]');
+      return t && t.textContent.trim() === name;
+    });
+  }
+
+  // Helper: React props accessor (works with React 18 fiber internals)
+  function getReactProps(el) {
+    var key = Object.keys(el).find(function(k) { return k.indexOf('__reactProps$') === 0; });
+    return key ? el[key] : null;
+  }
+
+  // Helper: cleanup canvas body click to clear any edit mode + close menus
+  function cleanupCanvasFocus() {
+    var canvasIframe = document.querySelector('#site-iframe-next') || document.querySelector('#site-iframe');
+    if (canvasIframe && canvasIframe.contentDocument && canvasIframe.contentDocument.body) {
+      canvasIframe.contentDocument.body.click();
+    }
+  }
+
+  /**
+   * addClassViaUI({className, waitMs?})
+   *
+   * Add a class to the currently selected element via the css-token-input.
+   * Creates a combo if element already has classes, or standalone if first class.
+   */
+  p._localCmd.addClassViaUI = async function(args) {
+    args = args || {};
+    var className = args.className;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 600;
+
+    if (!className || typeof className !== 'string') {
+      return { ok: false, error: 'className_required', got: typeof className };
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(className)) {
+      return { ok: false, error: 'invalid_class_name',
+               message: 'className must match /^[a-zA-Z0-9_-]+$/ (canon §cluster-create-style gotcha #17)',
+               className: className };
+    }
+
+    var start = Date.now();
+    var chipsBefore = getCurrentChips();
+
+    var input = document.querySelector('[data-automation-id="css-token-input"]');
+    if (!input) return { ok: false, error: 'css_token_input_not_found',
+                         message: 'No element selected in Designer ? Style panel must be visible.' };
+
+    input.focus();
+    await wait(200);
+
+    // Set value via native setter (bypass React shadow setter)
+    var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    nativeSetter.call(input, className);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(300);
+
+    // Press Enter
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    await wait(waitMs);
+
+    var chipsAfter = getCurrentChips();
+    var success = chipsAfter.indexOf(className) !== -1 && chipsAfter.length > chipsBefore.length;
+
+    return {
+      ok: success,
+      className: className,
+      chips_before: chipsBefore,
+      chips_after: chipsAfter,
+      is_combo: chipsAfter.length >= 2,
+      durationMs: Date.now() - start
+    };
+  };
+
+  /**
+   * removeLastClassViaUI({waitMs?})
+   *
+   * Remove the LAST class attached to the currently selected element via input + Backspace.
+   * Equivalent UI to focusing the css-token-input (empty) and pressing Backspace.
+   */
+  p._localCmd.removeLastClassViaUI = async function(args) {
+    args = args || {};
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 600;
+
+    var start = Date.now();
+    var chipsBefore = getCurrentChips();
+    if (chipsBefore.length === 0) {
+      return { ok: false, error: 'no_chips_to_remove',
+               message: 'Selected element has no classes attached' };
+    }
+
+    var input = document.querySelector('[data-automation-id="css-token-input"]');
+    if (!input) return { ok: false, error: 'css_token_input_not_found' };
+
+    input.focus();
+    await wait(200);
+
+    // Ensure input is empty before Backspace
+    var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    nativeSetter.call(input, '');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(200);
+
+    // Press Backspace
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8, bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8, bubbles: true }));
+    await wait(waitMs);
+
+    var chipsAfter = getCurrentChips();
+    var removed = chipsBefore[chipsBefore.length - 1];
+    var success = chipsAfter.length < chipsBefore.length;
+
+    return {
+      ok: success,
+      removed: success ? removed : null,
+      chips_before: chipsBefore,
+      chips_after: chipsAfter,
+      durationMs: Date.now() - start
+    };
+  };
+
+  /**
+   * removeClassFromElementViaUI({className, waitMs?})
+   *
+   * Detach a specific class from the selected element via chip menu → Remove class.
+   * Bypass gotcha #15 (set_style enrichit silencieusement avec parent).
+   * The class remains in the registry and on other elements — only this element's binding is removed.
+   */
+  p._localCmd.removeClassFromElementViaUI = async function(args) {
+    args = args || {};
+    var className = args.className;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 600;
+
+    if (!className) return { ok: false, error: 'className_required' };
+
+    var start = Date.now();
+    var chipsBefore = getCurrentChips();
+    if (chipsBefore.indexOf(className) === -1) {
+      return { ok: false, error: 'class_not_attached_to_element',
+               className: className, chips: chipsBefore };
+    }
+
+    // Ensure out of edit mode
+    cleanupCanvasFocus();
+    await wait(300);
+
+    // 1. Find chip
+    var chip = findChipByName(className);
+    if (!chip) return { ok: false, error: 'chip_not_found_after_cleanup', className: className };
+
+    // 2. Trigger React hover to mount menu indicator (dispatchEvent mouseenter ne marche pas)
+    var chipProps = getReactProps(chip);
+    if (!chipProps || typeof chipProps.onMouseEnter !== 'function') {
+      return { ok: false, error: 'react_props_inaccessible',
+               message: 'Webflow React internals may have changed (look for __reactProps$ key)' };
+    }
+    try { chipProps.onMouseEnter({ bubbles: true }); }
+    catch (e) { return { ok: false, error: 'onMouseEnter_threw', message: e.message }; }
+    await wait(400);
+
+    // 3. Click menu indicator (.click() NATIF — dispatchEvent click est intercepté par overlays)
+    var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
+    if (!indicator) {
+      return { ok: false, error: 'menu_indicator_not_mounted',
+               message: 'Hover React n\'a pas mounté l\'indicator — chip peut-être en mode édit ?' };
+    }
+    indicator.click();
+    await wait(500);
+
+    // 4. Click Remove option
+    var removeOpt = document.querySelector('[data-automation-id="css-tokens-remove-class"]');
+    if (!removeOpt) {
+      return { ok: false, error: 'remove_option_not_visible',
+               message: 'Menu chip ne s\'est pas ouvert après click indicator' };
+    }
+    removeOpt.click();
+    await wait(waitMs);
+
+    var chipsAfter = getCurrentChips();
+    var removed = chipsAfter.indexOf(className) === -1;
+
+    return {
+      ok: removed,
+      className: className,
+      chips_before: chipsBefore,
+      chips_after: chipsAfter,
+      durationMs: Date.now() - start
+    };
+  };
+
+  /**
+   * renameClassViaUI({oldName, newName, waitMs?})
+   *
+   * Rename a class throughout the site via chip menu → Rename → edit contentEditable + Enter.
+   * ⚠️ DESTRUCTIF GLOBAL : la classe est renommée sur TOUS les éléments du site qui l'utilisent.
+   *
+   * GOTCHA contentEditable : dispatchEvent KeyboardEvent ignoré → use document.execCommand
+   * fallback to direct textContent + InputEvent. Not validated empirically — best effort.
+   */
+  p._localCmd.renameClassViaUI = async function(args) {
+    args = args || {};
+    var oldName = args.oldName;
+    var newName = args.newName;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 800;
+
+    if (!oldName || !newName) return { ok: false, error: 'oldName_and_newName_required' };
+    if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+      return { ok: false, error: 'invalid_new_name',
+               message: 'newName must match /^[a-zA-Z0-9_-]+$/', newName: newName };
+    }
+    if (oldName === newName) return { ok: false, error: 'no_op_same_name' };
+
+    var start = Date.now();
+
+    cleanupCanvasFocus();
+    await wait(300);
+
+    // 1. Find chip with oldName
+    var chip = findChipByName(oldName);
+    if (!chip) return { ok: false, error: 'chip_not_found', oldName: oldName };
+
+    // 2. React hover + indicator click
+    var chipProps = getReactProps(chip);
+    if (!chipProps || typeof chipProps.onMouseEnter !== 'function') {
+      return { ok: false, error: 'react_props_inaccessible' };
+    }
+    chipProps.onMouseEnter({ bubbles: true });
+    await wait(400);
+
+    var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
+    if (!indicator) return { ok: false, error: 'menu_indicator_not_mounted' };
+    indicator.click();
+    await wait(500);
+
+    // 3. Click Rename option (this should activate edit mode on the chip text)
+    var renameOpt = document.querySelector('[data-automation-id="css-tokens-rename-class"]');
+    if (!renameOpt) return { ok: false, error: 'rename_option_not_visible' };
+    renameOpt.click();
+    await wait(500);
+
+    // 4. Find editable span — should be the chip text now in edit mode
+    var editSpan = document.querySelector('[data-automation-id="style-rule-token-text-editable"]');
+    if (!editSpan || editSpan.contentEditable !== 'true') {
+      return { ok: false, error: 'edit_mode_not_active_after_rename_click',
+               message: 'Rename option click did not enter edit mode on chip text' };
+    }
+
+    editSpan.focus();
+    await wait(200);
+
+    // 5. Select all + insert new text — execCommand path (deprecated mais marche encore)
+    var execCommandOk = false;
+    try {
+      var range = document.createRange();
+      range.selectNodeContents(editSpan);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      execCommandOk = document.execCommand('insertText', false, newName);
+    } catch (e) { execCommandOk = false; }
+
+    // 6. Fallback if execCommand failed : direct textContent + InputEvent
+    if (!execCommandOk) {
+      editSpan.textContent = newName;
+      try {
+        editSpan.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'insertText',
+          data: newName
+        }));
+      } catch (e) { /* InputEvent unsupported on older browsers */ }
+    }
+    await wait(300);
+
+    // 7. Press Enter to commit + blur as backup
+    editSpan.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    await wait(200);
+    editSpan.blur();
+    await wait(waitMs);
+
+    // 8. Verify rename via chips state
+    var chipsAfter = getCurrentChips();
+    var renamed = chipsAfter.indexOf(newName) !== -1 && chipsAfter.indexOf(oldName) === -1;
+
+    return {
+      ok: renamed,
+      oldName: oldName,
+      newName: newName,
+      chips_after: chipsAfter,
+      exec_command_used: execCommandOk,
+      durationMs: Date.now() - start,
+      warning: !renamed ? 'Rename may have partially failed — verify visually in Designer' : null
+    };
+  };
+
+  console.log('[StyleSelectorUI] 4 commands registered: addClassViaUI · removeLastClassViaUI · removeClassFromElementViaUI · renameClassViaUI (v3.18.0 s568)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -3781,7 +4127,11 @@
     'getEmbedContentViaUI',
     'getCurrentPageInfo',
     'dumpTree',
-    'scrollToElement'
+    'scrollToElement',
+    'addClassViaUI',
+    'removeLastClassViaUI',
+    'removeClassFromElementViaUI',
+    'renameClassViaUI'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
