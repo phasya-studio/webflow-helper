@@ -1,4 +1,4 @@
-/* Webflow Helper v3.17.0 - 2026-05-20 */
+/* Webflow Helper v3.18.0 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.18.0';
+  var VERSION = '3.19.0';
+  // [v3.19.0 (s568)] (1) Fix cleanupEditMode (v3.18.0 cleanupCanvasFocus déselectionnait l'élément
+  // → renameClassViaUI cassait avec chip_not_found). Maintenant ESC + blur active editable
+  // sans toucher canvas. (2) Add duplicateClassViaUI (5e cmd Style Selector UI) :
+  // workflow chip menu → Duplicate class, détecte le nouveau nom auto-généré par Webflow.
   // [v3.18.0 (s568)] Style Selector UI actions (4 cmds) : addClassViaUI, removeLastClassViaUI,
   // removeClassFromElementViaUI, renameClassViaUI. Bypass 5 gotchas style_tool MCP
   // (#5 style_ids non supporté · #15 set_style enrichit silencieusement · #20 parent_style_names
@@ -3820,11 +3824,21 @@
     return key ? el[key] : null;
   }
 
-  // Helper: cleanup canvas body click to clear any edit mode + close menus
-  function cleanupCanvasFocus() {
-    var canvasIframe = document.querySelector('#site-iframe-next') || document.querySelector('#site-iframe');
-    if (canvasIframe && canvasIframe.contentDocument && canvasIframe.contentDocument.body) {
-      canvasIframe.contentDocument.body.click();
+  // Helper: cleanup edit mode WITHOUT deselecting current element.
+  // FIX v3.18.1 : canvas body click était utilisé v3.18.0 mais DÉSÉLECTIONNAIT l'élément
+  // → bug "chip_not_found" car le selector-widget se vidait. Use ESC + blur active editable.
+  function cleanupEditMode() {
+    // 1. ESC to close any open dropdown/menu
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    // 2. Blur active editable span (chip in rename mode) — sans changer la sélection canvas
+    var editSpan = document.querySelector('[data-automation-id="style-rule-token-text-editable"]');
+    if (editSpan && typeof editSpan.blur === 'function') {
+      editSpan.blur();
+    }
+    // 3. Blur css-token-input if focused
+    var activeEl = document.activeElement;
+    if (activeEl && activeEl.tagName === 'INPUT' && activeEl.getAttribute('data-automation-id') === 'css-token-input') {
+      activeEl.blur();
     }
   }
 
@@ -3951,7 +3965,7 @@
     }
 
     // Ensure out of edit mode
-    cleanupCanvasFocus();
+    cleanupEditMode();
     await wait(300);
 
     // 1. Find chip
@@ -4022,7 +4036,7 @@
 
     var start = Date.now();
 
-    cleanupCanvasFocus();
+    cleanupEditMode();
     await wait(300);
 
     // 1. Find chip with oldName
@@ -4103,7 +4117,74 @@
     };
   };
 
-  console.log('[StyleSelectorUI] 4 commands registered: addClassViaUI · removeLastClassViaUI · removeClassFromElementViaUI · renameClassViaUI (v3.18.0 s568)');
+  /**
+   * duplicateClassViaUI({className, waitMs?})
+   *
+   * Duplicate a class via chip menu → Duplicate class.
+   * Creates a copy of the class (with its props) under a new auto-generated name (Webflow defaults
+   * to "<className> Copy" or similar). The duplicate is attached to the current element automatically.
+   *
+   * Workflow identical to removeClassFromElementViaUI but click sur css-tokens-duplicate-class.
+   */
+  p._localCmd.duplicateClassViaUI = async function(args) {
+    args = args || {};
+    var className = args.className;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 600;
+
+    if (!className) return { ok: false, error: 'className_required' };
+
+    var start = Date.now();
+    var chipsBefore = getCurrentChips();
+    if (chipsBefore.indexOf(className) === -1) {
+      return { ok: false, error: 'class_not_attached_to_element',
+               className: className, chips: chipsBefore };
+    }
+
+    cleanupEditMode();
+    await wait(300);
+
+    // 1. Find chip
+    var chip = findChipByName(className);
+    if (!chip) return { ok: false, error: 'chip_not_found_after_cleanup', className: className };
+
+    // 2. React onMouseEnter to mount menu indicator
+    var chipProps = getReactProps(chip);
+    if (!chipProps || typeof chipProps.onMouseEnter !== 'function') {
+      return { ok: false, error: 'react_props_inaccessible' };
+    }
+    try { chipProps.onMouseEnter({ bubbles: true }); }
+    catch (e) { return { ok: false, error: 'onMouseEnter_threw', message: e.message }; }
+    await wait(400);
+
+    // 3. Click indicator
+    var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
+    if (!indicator) return { ok: false, error: 'menu_indicator_not_mounted' };
+    indicator.click();
+    await wait(500);
+
+    // 4. Click Duplicate option
+    var dupOpt = document.querySelector('[data-automation-id="css-tokens-duplicate-class"]');
+    if (!dupOpt) return { ok: false, error: 'duplicate_option_not_visible' };
+    dupOpt.click();
+    await wait(waitMs);
+
+    var chipsAfter = getCurrentChips();
+    // Webflow génère un nom auto pour le duplicate (ex: "_test-bg-red 2" ou similaire)
+    // On détecte le nouveau chip = chip qui n'était pas dans chipsBefore
+    var newChips = chipsAfter.filter(function(c) { return chipsBefore.indexOf(c) === -1; });
+    var success = newChips.length > 0;
+
+    return {
+      ok: success,
+      source_class: className,
+      new_class_name: newChips[0] || null,
+      chips_before: chipsBefore,
+      chips_after: chipsAfter,
+      durationMs: Date.now() - start
+    };
+  };
+
+  console.log('[StyleSelectorUI] 5 commands registered: addClassViaUI · removeLastClassViaUI · removeClassFromElementViaUI · renameClassViaUI · duplicateClassViaUI (v3.19.0 s568)');
 })();
 
 (function filterExposedCmds() {
@@ -4131,7 +4212,8 @@
     'addClassViaUI',
     'removeLastClassViaUI',
     'removeClassFromElementViaUI',
-    'renameClassViaUI'
+    'renameClassViaUI',
+    'duplicateClassViaUI'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
