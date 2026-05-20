@@ -119,7 +119,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.13.0';
+  var VERSION = '3.14.0';
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -2107,6 +2107,93 @@
   }
 
   /**
+   * Reposition the Bridge App floating window via React state dispatch.
+   * Works by walking the React fiber tree to find FloatingWindowInner's
+   * useState hook for {x, y} and calling its dispatch directly.
+   *
+   * @param {string|object} position - 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}
+   * @param {number} [margin=16] - Pixels from the corner (ignored when position is {x, y})
+   * @returns {object} {ok, before?, target?, bounds?, error?}
+   * @private
+   */
+  function setBridgeWindowPosition(position, margin) {
+    margin = typeof margin === 'number' ? margin : 16;
+    var iframe = document.querySelector('iframe[src*="webflow-ext.com"]');
+    if (!iframe) return { ok: false, error: 'iframe_not_found' };
+
+    var dragContainer = iframe.parentElement && iframe.parentElement.parentElement;
+    if (!dragContainer || !dragContainer.classList || !dragContainer.classList.contains('react-draggable')) {
+      return { ok: false, error: 'drag_container_not_found' };
+    }
+
+    var fiberKey = Object.keys(dragContainer).find(function(k) {
+      return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactInternalInstance') === 0;
+    });
+    if (!fiberKey) return { ok: false, error: 'react_fiber_not_found' };
+
+    // Walk up to FloatingWindowInner
+    var fiber = dragContainer[fiberKey];
+    var inner = null;
+    var depth = 0;
+    while (fiber && depth < 25) {
+      var name = fiber.type && (fiber.type.displayName || fiber.type.name);
+      if (name === 'FloatingWindowInner') { inner = fiber; break; }
+      fiber = fiber.return;
+      depth++;
+    }
+    if (!inner) return { ok: false, error: 'FloatingWindowInner_not_found' };
+
+    // Find position hook (useState containing {x, y})
+    var h = inner.memoizedState;
+    var positionHook = null;
+    while (h) {
+      var ms = h.memoizedState;
+      if (ms && typeof ms === 'object' && typeof ms.x === 'number' && typeof ms.y === 'number' && !ms.current) {
+        positionHook = h;
+        break;
+      }
+      h = h.next;
+    }
+    if (!positionHook) return { ok: false, error: 'position_hook_not_found' };
+    if (!positionHook.queue || !positionHook.queue.dispatch) {
+      return { ok: false, error: 'no_dispatch_on_hook' };
+    }
+
+    // Bounds: walk fiber to find Draggable (class component with state.x/y)
+    var bounds = null;
+    var f2 = dragContainer[fiberKey];
+    var d2 = 0;
+    while (f2 && d2 < 10) {
+      if (f2.stateNode && f2.stateNode.state && typeof f2.stateNode.state.x === 'number') {
+        bounds = f2.memoizedProps && f2.memoizedProps.bounds;
+        break;
+      }
+      f2 = f2.return;
+      d2++;
+    }
+    if (!bounds) return { ok: false, error: 'bounds_not_found' };
+
+    var before = { x: positionHook.memoizedState.x, y: positionHook.memoizedState.y };
+    var target;
+    if (typeof position === 'object' && position !== null) {
+      target = { x: position.x, y: position.y };
+    } else {
+      switch (position) {
+        case 'bottom-right': target = { x: bounds.right - margin, y: bounds.bottom - margin }; break;
+        case 'bottom-left':  target = { x: bounds.left + margin, y: bounds.bottom - margin }; break;
+        case 'top-right':    target = { x: bounds.right - margin, y: bounds.top + margin }; break;
+        case 'top-left':     target = { x: bounds.left + margin, y: bounds.top + margin }; break;
+        default: return { ok: false, error: 'invalid_position', position: position };
+      }
+    }
+    target.x = Math.max(bounds.left, Math.min(bounds.right, target.x));
+    target.y = Math.max(bounds.top, Math.min(bounds.bottom, target.y));
+
+    positionHook.queue.dispatch(target);
+    return { ok: true, before: before, target: target, bounds: bounds };
+  }
+
+  /**
    * Mount the Webflow MCP Bridge App by dispatching `EXTENSION_OPEN` directly.
    * Auto-resolves the appId from `AppsStore.installedApps[*]` so no hard-coded hash
    * is needed. Idempotent : if the iframe is already mounted, returns immediately.
@@ -2116,6 +2203,10 @@
    * @param {boolean} [args.strict=true]    Return `ok:false` if not converged.
    * @param {boolean} [args.minimized=true] Auto-minimize after mount (the open Bridge
    *   window covers the canvas).
+   * @param {string|object} [args.position] Optional repositioning after mount.
+   *   Accepts: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}.
+   *   If omitted, keeps React-Draggable's default position.
+   * @param {number}  [args.position_margin=16] Pixels from corner when position is a string.
    * @returns {Promise<object>}
    */
   p._localCmd.launchBridgeApp = async function(args) {
@@ -2125,6 +2216,8 @@
     var strict = args.strict !== false;
     // Default minimized = true (the open Bridge App window covers the canvas).
     var minimized = args.minimized !== false;
+    var requestedPosition = args.position; // undefined = no positioning
+    var positionMargin = typeof args.position_margin === 'number' ? args.position_margin : 16;
 
     // Idempotent: if Bridge is already active, return immediately (option: minimize anyway).
     if (isBridgeIframePresent()) {
@@ -2133,10 +2226,15 @@
           dispatchExtensionAction('EXTENSION_WINDOW_MODE_TOGGLE', { minimized: true });
         } catch (e) {}
       }
+      var posReused = null;
+      if (requestedPosition) {
+        try { posReused = setBridgeWindowPosition(requestedPosition, positionMargin); } catch (e) { posReused = { ok: false, error: e.message }; }
+      }
       return {
         ok: true,
         already_active: true,
         minimized_applied: minimized,
+        position_applied: posReused,
         duration_ms: Date.now() - startTs
       };
     }
@@ -2205,12 +2303,24 @@
       } catch (e) {}
     }
 
+    // Optional repositioning after mount (uses React fiber + useState hook dispatch).
+    // Best-effort: failures here never block the launch result.
+    var position_applied = null;
+    if (requestedPosition && converged) {
+      try {
+        position_applied = setBridgeWindowPosition(requestedPosition, positionMargin);
+      } catch (e) {
+        position_applied = { ok: false, error: 'exception', message: e.message };
+      }
+    }
+
     return {
       ok: converged,
       bridge_app_id: bridge.id,
       bridge_app_name: bridge.name,
       iframe_mounted_after_ms: converged ? Date.now() - startTs - 500 : null,
       minimized_applied: minimize_applied,
+      position_applied: position_applied,
       duration_ms: Date.now() - startTs,
       note: 'Bridge mounted + handshake assumed complete after 500ms wait'
     };
