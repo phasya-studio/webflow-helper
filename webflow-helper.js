@@ -1,4 +1,4 @@
-/* Webflow Helper v3.19.2 - 2026-05-20 */
+/* Webflow Helper v3.20.0 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.0';
+  var VERSION = '3.20.1';
+  // [v3.20.1 (s568)] Fix duplicateClassViaUI : ajout ESC + blur cleanup après click duplicate
+  // option car Webflow laisse le chip dupliqué en mode édit (contentEditable focused pour
+  // rename immédiat workflow UX). Sans cleanup, état "ouvert" qui interfère avec actions
+  // suivantes. JSDoc enrichi avec comportement "swap pas add" et suffix " Copy" validé empirique.
   // [v3.20.0 (s568)] Add cleanupUnusedStylesViaUI — 6e cmd Style Selector UI : bulk delete
   // orphelines via Style Manager (raccourci G + Clean up styles button + Delete). Bypass
   // gotchas #22 + #23 (remove_style refuse attached + parent_style_names cassé). Option
@@ -4165,13 +4169,21 @@
   };
 
   /**
-   * duplicateClassViaUI({className, waitMs?})
+   * duplicateClassViaUI({className, waitMs?}) — validated empirique s568
    *
    * Duplicate a class via chip menu → Duplicate class.
-   * Creates a copy of the class (with its props) under a new auto-generated name (Webflow defaults
-   * to "<className> Copy" or similar). The duplicate is attached to the current element automatically.
+   * Validé empirique session s568 sur Sandbox AVG (1 test isolated, props 100% copiées).
    *
-   * Workflow identical to removeClassFromElementViaUI but click sur css-tokens-duplicate-class.
+   * COMPORTEMENT WEBFLOW (validé empirique) :
+   * - Suffix auto-généré : "<className> Copy" (avec un espace · validé)
+   * - **SWAP, pas add** : l'élément perd la classe source et reçoit la copie À LA PLACE.
+   *   Ex: élément `[_dup-source]` après duplicate → `[_dup-source Copy]` (_dup-source détaché).
+   *   La source class reste au registry (intacte), juste plus attachée à cet élément.
+   * - Toutes les props CSS de la source sont copiées dans la nouvelle classe.
+   * - Webflow laisse le chip dupliqué en MODE ÉDIT (contentEditable focused) pour permettre
+   *   rename immédiat. La cmd v3.20.1 ESC + blur pour cleanup → état propre post-call.
+   *
+   * Workflow : chip menu hover → click indicator → click css-tokens-duplicate-class → ESC cleanup.
    */
   p._localCmd.duplicateClassViaUI = async function(args) {
     args = args || {};
@@ -4215,8 +4227,17 @@
     dupOpt.click();
     await wait(waitMs);
 
+    // FIX v3.20.1 : Webflow laisse le chip dupliqué en mode édit (contentEditable focused)
+    // pour permettre rename immédiat. Cleanup : ESC + blur pour sortir du mode édit propre.
+    var editSpanAfter = document.querySelector('[data-automation-id="style-rule-token-text-editable"]');
+    if (editSpanAfter && typeof editSpanAfter.blur === 'function') {
+      editSpanAfter.blur();
+    }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await wait(300);
+
     var chipsAfter = getCurrentChips();
-    // Webflow génère un nom auto pour le duplicate (ex: "_test-bg-red 2" ou similaire)
+    // Webflow génère un nom auto pour le duplicate avec suffix " Copy" (validé empirique s568)
     // On détecte le nouveau chip = chip qui n'était pas dans chipsBefore
     var newChips = chipsAfter.filter(function(c) { return chipsBefore.indexOf(c) === -1; });
     var success = newChips.length > 0;
