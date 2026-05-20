@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.0 - 2026-05-20 */
+/* Webflow Helper v3.20.1 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,10 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.1';
+  var VERSION = '3.20.2';
+  // [v3.20.2 (s568)] Fix cleanupUnusedStylesViaUI : remplace keydown G shortcut (Webflow exige
+  // trusted event impossible via JS) par click sur left-sidebar-styles-button (DOM cliquable
+  // équivalent). Validé empirique : aria-label "Style selectors (G)" = même action. Plus stable.
   // [v3.20.1 (s568)] Fix duplicateClassViaUI : ajout ESC + blur cleanup après click duplicate
   // option car Webflow laisse le chip dupliqué en mode édit (contentEditable focused pour
   // rename immédiat workflow UX). Sans cleanup, état "ouvert" qui interfère avec actions
@@ -4281,30 +4284,22 @@
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await wait(300);
 
-    // 1. Focus Navigator (pré-requis pour que G shortcut soit capté)
-    var treeView = document.querySelector('[data-automation-id="tree-view-container"]');
-    if (!treeView) {
-      return { ok: false, error: 'navigator_not_found',
-               message: 'tree-view-container not in DOM — Designer may not be ready' };
+    // 1. FIX v3.20.2 : click sur left-sidebar-styles-button (équivalent shortcut G mais DOM cliquable)
+    // Le shortcut G via dispatchEvent KeyboardEvent NE MARCHE PAS (Webflow exige trusted event).
+    // Le bouton sidebar fait exactement la même action en click natif (validé empirique s568).
+    var stylesSidebarBtn = document.querySelector('[data-automation-id="left-sidebar-styles-button"]');
+    if (!stylesSidebarBtn) {
+      return { ok: false, error: 'styles_sidebar_button_not_found',
+               message: 'left-sidebar-styles-button absent — Webflow UI may have changed' };
     }
-    treeView.click();
-    await wait(300);
-
-    // 2. Trigger G keydown sur document (shortcut global Webflow)
-    document.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'g', code: 'KeyG', keyCode: 71, which: 71,
-      bubbles: true, cancelable: true
-    }));
-    document.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'g', code: 'KeyG', keyCode: 71, which: 71, bubbles: true
-    }));
+    stylesSidebarBtn.click();
     await wait(700);
 
-    // 3. Vérifier que le Style Manager s'est ouvert
+    // 2. Vérifier que le Style Manager s'est ouvert
     var stylesPanel = document.querySelector('[data-automation-id="styles"]');
     if (!stylesPanel) {
       return { ok: false, error: 'style_manager_did_not_open',
-               message: 'G shortcut not captured — Navigator may not have focus, or another modal is blocking' };
+               message: 'Click sidebar button did not open Style Manager — modal may be blocking' };
     }
 
     // 4. Click "Clean up styles" button
