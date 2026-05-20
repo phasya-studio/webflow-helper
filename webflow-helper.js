@@ -1,4 +1,4 @@
-/* Webflow Helper v3.18.0 - 2026-05-20 */
+/* Webflow Helper v3.19.0 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.19.0';
+  var VERSION = '3.19.1';
+  // [v3.19.1 (s568)] Fix critical : `indicator.click()` natif seul N'OUVRE PAS le menu chip
+  // (validé empirique session s568 — menu_options_after_click: []). Solution : sequence complète
+  // pointerdown + mousedown + 50ms gap + pointerup + mouseup + click. Factorisée dans helper
+  // `clickMenuIndicator()`. Patché les 3 cmds menu (remove/rename/duplicate).
   // [v3.19.0 (s568)] (1) Fix cleanupEditMode (v3.18.0 cleanupCanvasFocus déselectionnait l'élément
   // → renameClassViaUI cassait avec chip_not_found). Maintenant ESC + blur active editable
   // sans toucher canvas. (2) Add duplicateClassViaUI (5e cmd Style Selector UI) :
@@ -3824,6 +3828,25 @@
     return key ? el[key] : null;
   }
 
+  // Helper: full mouse sequence click sur menu indicator (validated empirique v3.19.1 s568).
+  // `.click()` natif seul NE SUFFIT PAS — le menu chip ne s'ouvre pas (intercepté ou state React incomplet).
+  // Séquence requise : pointerdown + mousedown + (gap 50ms) + pointerup + mouseup + click natif.
+  function clickMenuIndicator(indicator) {
+    var ir = indicator.getBoundingClientRect();
+    var evtBase = { bubbles: true, cancelable: true, view: window, button: 0,
+                    clientX: ir.left + ir.width/2, clientY: ir.top + ir.height/2 };
+    indicator.dispatchEvent(new PointerEvent('pointerdown', Object.assign({}, evtBase, {pointerType: 'mouse', isPrimary: true, buttons: 1})));
+    indicator.dispatchEvent(new MouseEvent('mousedown', Object.assign({}, evtBase, {buttons: 1})));
+    return new Promise(function(resolve) {
+      setTimeout(function() {
+        indicator.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, evtBase, {pointerType: 'mouse', isPrimary: true, buttons: 0})));
+        indicator.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, evtBase, {buttons: 0})));
+        indicator.dispatchEvent(new MouseEvent('click', Object.assign({}, evtBase, {buttons: 0})));
+        resolve();
+      }, 50);
+    });
+  }
+
   // Helper: cleanup edit mode WITHOUT deselecting current element.
   // FIX v3.18.1 : canvas body click était utilisé v3.18.0 mais DÉSÉLECTIONNAIT l'élément
   // → bug "chip_not_found" car le selector-widget se vidait. Use ESC + blur active editable.
@@ -3988,8 +4011,8 @@
       return { ok: false, error: 'menu_indicator_not_mounted',
                message: 'Hover React n\'a pas mounté l\'indicator — chip peut-être en mode édit ?' };
     }
-    indicator.click();
-    await wait(500);
+    await clickMenuIndicator(indicator);
+    await wait(700);
 
     // 4. Click Remove option
     var removeOpt = document.querySelector('[data-automation-id="css-tokens-remove-class"]');
@@ -4053,8 +4076,8 @@
 
     var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
     if (!indicator) return { ok: false, error: 'menu_indicator_not_mounted' };
-    indicator.click();
-    await wait(500);
+    await clickMenuIndicator(indicator);
+    await wait(700);
 
     // 3. Click Rename option (this should activate edit mode on the chip text)
     var renameOpt = document.querySelector('[data-automation-id="css-tokens-rename-class"]');
@@ -4159,8 +4182,8 @@
     // 3. Click indicator
     var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
     if (!indicator) return { ok: false, error: 'menu_indicator_not_mounted' };
-    indicator.click();
-    await wait(500);
+    await clickMenuIndicator(indicator);
+    await wait(700);
 
     // 4. Click Duplicate option
     var dupOpt = document.querySelector('[data-automation-id="css-tokens-duplicate-class"]');
