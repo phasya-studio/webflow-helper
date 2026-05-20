@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.8 - 2026-05-20 */
+/* Webflow Helper v3.20.9 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.9';
+  var VERSION = '3.20.10';
+  // [v3.20.10 (s569)] Fix race condition `addClassViaUI` chips DOM vs Redux : après Enter,
+  // chips_after lu trop tôt peut être vide alors que Redux state contient déjà la classe
+  // (validé empirique s569 sur uppercase legacy `BodyM-500`). Fix : fallback Redux check via
+  // `getSelectedNodeClasses()` quand chips DOM check fail. Élimine les ok:false trompeurs.
   // [v3.20.9 (s569)] Opt-in flag `allowLegacyUppercase: true` sur addClassViaUI + renameClassViaUI.
   // Permet d'attacher/renommer des classes legacy Phasya en uppercase (BodyM-500, BodyXL-500, etc.)
   // existant au registry. Par défaut lowercase strict reste appliqué (convention).
@@ -3896,6 +3900,26 @@
     }).filter(function(t) { return t.length > 0; });
   }
 
+  // v3.20.10 — Read selected element's class names from Redux store (ground truth, no DOM race).
+  // Used by addClassViaUI as fallback when chips DOM check fails after Enter (chips lag behind Redux).
+  function getSelectedNodeClasses() {
+    try {
+      var stores = window._webflow && window._webflow.stores;
+      var selectedId = stores && stores.UiNodeStore && stores.UiNodeStore.state && stores.UiNodeStore.state.selectedNodeNativeId;
+      if (!selectedId) return null;
+      var node = helpers.findNodeById(selectedId);
+      if (!node) return null;
+      var data = node.get && node.get('data');
+      var sbIds = data && data.get && data.get('styleBlockIds');
+      var arr = sbIds && sbIds.toJS ? sbIds.toJS() : (Array.isArray(sbIds) ? sbIds : []);
+      var state = helpers.getReduxState();
+      var sbStore = state && state.StyleBlockStore;
+      var blocks = sbStore && sbStore.get && sbStore.get('styleBlocks');
+      var sbs = blocks && blocks.toJS ? blocks.toJS() : blocks;
+      return arr.map(function(s) { return (sbs && sbs[s] && sbs[s].name) || s; });
+    } catch (e) { return null; }
+  }
+
   // Helper: find chip wrapper containing exact class name (passive state)
   function findChipByName(name) {
     var wrappers = Array.from(document.querySelectorAll('[data-automation-id="selector-widget"] [data-automation-id="style-rule-token-wrapper"]'));
@@ -3994,15 +4018,29 @@
     await wait(waitMs);
 
     var chipsAfter = getCurrentChips();
-    var success = chipsAfter.indexOf(className) !== -1 && chipsAfter.length > chipsBefore.length;
+    var domSuccess = chipsAfter.indexOf(className) !== -1 && chipsAfter.length > chipsBefore.length;
+
+    // v3.20.10 — Fallback Redux verify when chips DOM read fails (race condition s569)
+    var reduxClasses = null;
+    var reduxSuccess = false;
+    if (!domSuccess) {
+      reduxClasses = getSelectedNodeClasses();
+      if (reduxClasses && reduxClasses.indexOf(className) !== -1) {
+        reduxSuccess = true;
+      }
+    }
+    var success = domSuccess || reduxSuccess;
+    var effectiveClasses = reduxSuccess ? reduxClasses : chipsAfter;
 
     return {
       ok: success,
       className: className,
       chips_before: chipsBefore,
       chips_after: chipsAfter,
-      is_combo: chipsAfter.length >= 2,
-      durationMs: Date.now() - start
+      is_combo: effectiveClasses.length >= 2,
+      durationMs: Date.now() - start,
+      redux_fallback_used: !domSuccess && reduxSuccess,
+      redux_classes: reduxSuccess ? reduxClasses : undefined
     };
   };
 
