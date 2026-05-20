@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.4 - 2026-05-20 */
+/* Webflow Helper v3.20.5 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.5';
+  var VERSION = '3.20.6';
+  // [v3.20.6 (s568)] Fix removeClassFromElementViaUI : detect disabled state du bouton "Remove class".
+  // Webflow refuse remove le PARENT d'un combo chain (chip suivi d'autre chip = combo virtuel
+  // qui aurait pas d'ancrage). Marqueurs DOM : hasAttribute('disabled') + pointer-events:none.
+  // Au lieu de silent fail, return error 'remove_option_disabled' avec hint clear pour user.
   // [v3.20.5 (s568)] Hygiène fermeture : cleanupUnusedStylesViaUI track état initial Style Manager
   // (wasInitiallyOpen) et close via sidebar toggle si la cmd l'a ouvert (sinon laisse comme trouvé).
   // Helper `closeIfWeOpened()` appelé sur tous les return paths. Best practice : laisser l'état
@@ -4047,6 +4051,24 @@
       return { ok: false, error: 'remove_option_not_visible',
                message: 'Menu chip ne s\'est pas ouvert après click indicator' };
     }
+
+    // FIX v3.20.6 : Detect disabled state (Webflow refuse remove parent d'un combo chain).
+    // Si chip a un combo enfant derrière (ex: _t1-base-x suivi de _t1-shared), Remove est grisé.
+    // Marqueurs disabled : hasAttribute('disabled') · pointer-events:none · opacity:0.6.
+    if (removeOpt.hasAttribute('disabled') || getComputedStyle(removeOpt).pointerEvents === 'none') {
+      // Close menu via ESC
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await wait(300);
+      return {
+        ok: false,
+        error: 'remove_option_disabled',
+        message: 'Webflow refuse remove de cette class — elle est parent d\'un combo chain. Remove le combo enfant d\'abord, puis re-essaie.',
+        className: className,
+        chips_chain: chipsBefore,
+        hint: 'Combo chain : un chip parent ne peut être supprimé tant qu\'un chip enfant le suit. Utiliser removeLastClassViaUI pour partir du bout de la chain, ou inverser l\'ordre des classes.'
+      };
+    }
+
     removeOpt.click();
     await wait(waitMs);
 
