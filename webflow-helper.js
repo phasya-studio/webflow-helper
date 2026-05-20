@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.1 - 2026-05-20 */
+/* Webflow Helper v3.20.2 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,12 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.2';
+  var VERSION = '3.20.3';
+  // [v3.20.3 (s568)] 2 fixes empiriques cleanup/duplicate :
+  // (1) cleanupUnusedStylesViaUI : retiré ESC initial — empiriquement il bloquait le sidebar.click()
+  //     suivant. Remplacé par pré-check Enter si mode édit chip détecté.
+  // (2) duplicateClassViaUI : remplacé ESC par Enter post-duplicate. ESC ne sortait pas vraiment
+  //     du mode édit + bloquait les cmds suivantes. Enter commit le nom auto-généré et sort propre.
   // [v3.20.2 (s568)] Fix cleanupUnusedStylesViaUI : remplace keydown G shortcut (Webflow exige
   // trusted event impossible via JS) par click sur left-sidebar-styles-button (DOM cliquable
   // équivalent). Validé empirique : aria-label "Style selectors (G)" = même action. Plus stable.
@@ -4230,14 +4235,16 @@
     dupOpt.click();
     await wait(waitMs);
 
-    // FIX v3.20.1 : Webflow laisse le chip dupliqué en mode édit (contentEditable focused)
-    // pour permettre rename immédiat. Cleanup : ESC + blur pour sortir du mode édit propre.
+    // FIX v3.20.3 : Webflow laisse le chip dupliqué en mode édit (contentEditable focused)
+    // pour permettre rename immédiat. v3.20.1 utilisait ESC mais empiriquement ESC ne quitte
+    // pas vraiment le mode édit + bloque le sidebar click suivant. Use Enter (commit) au lieu.
     var editSpanAfter = document.querySelector('[data-automation-id="style-rule-token-text-editable"]');
-    if (editSpanAfter && typeof editSpanAfter.blur === 'function') {
-      editSpanAfter.blur();
+    if (editSpanAfter) {
+      editSpanAfter.focus();
+      await wait(100);
+      editSpanAfter.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      await wait(400);
     }
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    await wait(300);
 
     var chipsAfter = getCurrentChips();
     // Webflow génère un nom auto pour le duplicate avec suffix " Copy" (validé empirique s568)
@@ -4280,13 +4287,20 @@
     var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 800;
     var start = Date.now();
 
-    // ESC cleanup état initial
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    await wait(300);
+    // FIX v3.20.3 : pas d'ESC initial — empiriquement il bloque le sidebar click suivant
+    // (validé session s568 : sans ESC le sidebar.click() ouvre Style Manager, avec ESC il ne fait rien).
+    // Pré-requis : caller doit s'assurer qu'aucun mode édit chip actif n'est en cours.
+    // Pour cela, `duplicateClassViaUI` v3.20.3 fait Enter (commit) automatique post-duplicate.
 
-    // 1. FIX v3.20.2 : click sur left-sidebar-styles-button (équivalent shortcut G mais DOM cliquable)
+    // Pré-check : si mode édit chip détecté → Enter pour commit + sortir proprement
+    var editSpanCheck = document.querySelector('[data-automation-id="style-rule-token-text-editable"]');
+    if (editSpanCheck && document.activeElement === editSpanCheck) {
+      editSpanCheck.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      await wait(400);
+    }
+
+    // 1. Click sur left-sidebar-styles-button (équivalent shortcut G mais DOM cliquable)
     // Le shortcut G via dispatchEvent KeyboardEvent NE MARCHE PAS (Webflow exige trusted event).
-    // Le bouton sidebar fait exactement la même action en click natif (validé empirique s568).
     var stylesSidebarBtn = document.querySelector('[data-automation-id="left-sidebar-styles-button"]');
     if (!stylesSidebarBtn) {
       return { ok: false, error: 'styles_sidebar_button_not_found',
