@@ -1,4 +1,4 @@
-/* Webflow Helper v3.19.0 - 2026-05-20 */
+/* Webflow Helper v3.19.1 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,11 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.19.1';
+  var VERSION = '3.19.2';
+  // [v3.19.2 (s568)] Doc enrichment : JSDoc renameClassViaUI documente le comportement
+  // empirique (standalone global vs combo local · flicker rebuild CSS · props préservation).
+  // No code change — versioning bump pour aligner avec canon webflow-helper-canon.md
+  // section §rename-behavior-empirique nouvellement ajoutée (4 cas validés s568).
   // [v3.19.1 (s568)] Fix critical : `indicator.click()` natif seul N'OUVRE PAS le menu chip
   // (validé empirique session s568 — menu_options_after_click: []). Solution : sequence complète
   // pointerdown + mousedown + 50ms gap + pointerup + mouseup + click. Factorisée dans helper
@@ -4038,11 +4042,27 @@
   /**
    * renameClassViaUI({oldName, newName, waitMs?})
    *
-   * Rename a class throughout the site via chip menu → Rename → edit contentEditable + Enter.
-   * ⚠️ DESTRUCTIF GLOBAL : la classe est renommée sur TOUS les éléments du site qui l'utilisent.
+   * Rename a class via chip menu → Rename → execCommand insertText + Enter.
+   * Validated empirique session s568 (4 cas).
    *
-   * GOTCHA contentEditable : dispatchEvent KeyboardEvent ignoré → use document.execCommand
-   * fallback to direct textContent + InputEvent. Not validated empirically — best effort.
+   * 🚨 COMPORTEMENT AMBIGU SELON CONTEXTE (canon §rename-behavior-empirique) :
+   *   - Si chip = STANDALONE seul → rename GLOBAL throughout site (tous éléments renamed,
+   *     props préservées, même style_id conservé).
+   *   - Si chip = COMBO virtuel dans une chain `parent.combo` → rename LOCAL à l'élément
+   *     sélectionné uniquement (autres usages de la même class sur d'autres parents intacts).
+   *     Props virtuelles préservées dans les 2 cas (même style_id).
+   *
+   * Webflow traite chaque paire `(parent_class, child_class)` comme une entité distincte
+   * au registry. Pour rename "throughout site" une combo class utilisée sur N parents,
+   * il faut rename chaque instance individuellement OU passer par le Class Manager (Q shortcut).
+   *
+   * FLICKER VISUEL POST-RENAME : pendant ~1-2s, le canvas peut afficher un état où le CSS
+   * n'est pas encore rebuilt → background/border peuvent disparaître temporairement. C'est
+   * comportement Webflow natif (pas une vraie perte définitive). Webflow rebuild le CSS et
+   * le rendu revient. Vérifier via dumpTree/query_styles pour ground truth.
+   *
+   * GOTCHA contentEditable : dispatchEvent KeyboardEvent ignoré par React → use
+   * document.execCommand('insertText') + InputEvent fallback. Validé empirique s568.
    */
   p._localCmd.renameClassViaUI = async function(args) {
     args = args || {};
