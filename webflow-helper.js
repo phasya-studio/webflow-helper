@@ -1,4 +1,4 @@
-/* Webflow Helper v3.14.3 - 2026-05-20 */
+/* Webflow Helper v3.16.0 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.16.0';
+  var VERSION = '3.17.0';
   // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
   // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
   // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
@@ -2121,6 +2121,123 @@
     }
   }
 
+  // ==========================================================================
+  // walkDOMFallback — v3.17.0 (s565)
+  // ==========================================================================
+  // Fallback walk du DOM iframe canvas quand le Redux walk retourne 0 match.
+  // Couvre les cas où l'élément est visible à l'écran mais absent du Redux store :
+  //   - Inner text d'un Symbol (ex: liens du Navbar, "Nos prestations")
+  //   - CMS binding rendu dynamiquement
+  //   - Content injecté par script embed
+  //
+  // Le walk DOM trouve l'élément + remap au `data-w-id` ancêtre Webflow le plus
+  // proche → utilisable pour scrollToElement, select_element, etc.
+  //
+  // Garde-fous :
+  //   - require filterText OU filterClass non-vide (sinon return error)
+  //   - limit: 10 par défaut (hard cap pour éviter explosion sur grosses pages)
+  //   - text tronqué à 200 chars
+  //   - skip child match deeper (on garde le node le plus précis)
+  //   - skip whitespace-only matches sur filterText
+  //
+  // Performance : 1-2ms typique (faster que Redux walk grâce à querySelectorAll)
+  // ==========================================================================
+  function walkDOMFallback(args, limit) {
+    args = args || {};
+    var filterTextLower = args.filterText ? String(args.filterText).toLowerCase() : null;
+    var filterClassLower = args.filterClass ? String(args.filterClass).toLowerCase() : null;
+    limit = typeof limit === 'number' ? limit : 10;
+
+    // Require valid non-empty filter
+    var hasValidFilter = (filterTextLower && filterTextLower.length > 0) ||
+                         (filterClassLower && filterClassLower.length > 0);
+    if (!hasValidFilter) {
+      return { ok: false, error: 'fallback_requires_filter',
+               message: 'DOM fallback requires non-empty filterText or filterClass' };
+    }
+
+    var iframe = document.querySelector('#site-iframe-next');
+    if (!iframe) return { ok: false, error: 'canvas_iframe_not_found' };
+    var doc;
+    try { doc = iframe.contentDocument; }
+    catch (e) { return { ok: false, error: 'cross_origin_blocked', message: e.message }; }
+    if (!doc || !doc.body) return { ok: false, error: 'iframe_document_unavailable' };
+
+    var t0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
+    var all = doc.querySelectorAll('body *');
+    var walked = 0;
+    var matches = [];
+
+    for (var i = 0; i < all.length && matches.length < limit; i++) {
+      walked++;
+      var el = all[i];
+      if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'NOSCRIPT') continue;
+
+      // filterText : match + skip-child-deeper pour précision
+      if (filterTextLower) {
+        var txt = (el.textContent || '').toLowerCase();
+        if (txt.indexOf(filterTextLower) === -1) continue;
+        var childMatchesDeeper = false;
+        for (var c = 0; c < el.children.length; c++) {
+          if ((el.children[c].textContent || '').toLowerCase().indexOf(filterTextLower) !== -1) {
+            childMatchesDeeper = true;
+            break;
+          }
+        }
+        if (childMatchesDeeper) continue;
+      }
+
+      // filterClass
+      if (filterClassLower) {
+        var cls = (el.className || '').toString().toLowerCase();
+        if (cls.indexOf(filterClassLower) === -1) continue;
+      }
+
+      var textPreview = (el.textContent || '').trim().slice(0, 200);
+      if (filterTextLower && !textPreview) continue;
+
+      // Find nearest ancestor with data-w-id (Webflow node ID utilisable)
+      var ancestor = el;
+      var ancestorDataWId = null, ancestorTag = null, ancestorClasses = null;
+      while (ancestor && ancestor !== doc.body) {
+        var dwid = ancestor.getAttribute('data-w-id');
+        if (dwid) {
+          ancestorDataWId = dwid;
+          ancestorTag = ancestor.tagName;
+          ancestorClasses = (ancestor.className || '').toString().slice(0, 80);
+          break;
+        }
+        ancestor = ancestor.parentElement;
+      }
+
+      // DOM depth (max 30 pour éviter infinite loop sur cycle improbable)
+      var depth = 0, p = el;
+      while (p && p !== doc.body && depth < 30) { depth++; p = p.parentElement; }
+
+      matches.push({
+        type: 'DOM',
+        tag: el.tagName,
+        text: textPreview,
+        classes: (el.className || '').toString().slice(0, 100).split(/\s+/).filter(Boolean),
+        data_w_id: el.getAttribute('data-w-id') || null,
+        ancestor_data_w_id: ancestorDataWId,
+        ancestor_tag: ancestorTag,
+        ancestor_classes: ancestorClasses,
+        dom_depth: depth
+      });
+    }
+
+    var endT = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
+    return {
+      ok: true,
+      source: 'dom_canvas',
+      count: matches.length,
+      total_walked: walked,
+      duration_ms: Math.round(endT - t0),
+      tree: matches
+    };
+  }
+
   p._localCmd.dumpTree = function(args) {
     args = args || {};
     var maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 50;
@@ -2280,12 +2397,34 @@
       }
     }, { maxDepth: maxDepth });
 
-    var result = { ok: true, count: out.length, total_walked: totalWalked, tree: out };
+    var result = { ok: true, count: out.length, total_walked: totalWalked, source: 'redux', tree: out };
     if (expandComponents) result.expanded = expandedCount;
     if (expandSlotOverrides) result.slot_overrides = slotOverridesCount; // v3.3.0
     if (rootIdScope) result.scoped_to = rootIdScope;
 
-    // v1.6.0 — hint heuristics for count===0
+    // v3.17.0 — DOM canvas fallback si Redux walk = 0 match + filter (Text|Class) actif
+    // Couvre les cas non-Redux : Symbol inner-text, CMS binding, content injecté par script.
+    // Skip si rootIdScope (l'utilisateur cible un subtree Redux spécifique).
+    var hasFallbackableFilter = !!(filterClassLower || filterTextLower);
+    if (out.length === 0 && hasFallbackableFilter && !rootIdScope) {
+      var fallback = walkDOMFallback({
+        filterText: args.filterText,
+        filterClass: args.filterClass
+      }, 10);
+      if (fallback.ok && fallback.count > 0) {
+        result.source = 'dom_canvas';
+        result.fallback_reason = 'redux_walk_no_match';
+        result.original_redux_count = 0;
+        result.count = fallback.count;
+        result.tree = fallback.tree;
+        result.dom_walk_duration_ms = fallback.duration_ms;
+        result.dom_walk_total = fallback.total_walked;
+        result.note = 'Match trouvé via DOM canvas walk (pas dans Redux store) — utiliser `ancestor_data_w_id` pour scrollToElement/select_element. Cas typique : Symbol inner-text, CMS binding, script-injected.';
+        return result;
+      }
+    }
+
+    // v1.6.0 — hint heuristics for count===0 (uniquement si fallback DOM aussi vide)
     if (out.length === 0) {
       var hint = null;
       var hasFilter = !!(filterClassLower || filterTextLower || filterType);
@@ -2294,9 +2433,9 @@
       } else if (filterClassLower && maxDepth < 12 && totalWalked < 200) {
         hint = "No match for class '" + args.filterClass + "' at maxDepth=" + maxDepth + " (walked " + totalWalked + ') — Webflow cards typically at depth 8-10, try maxDepth>=12 or remove maxDepth (default 50)';
       } else if (filterClassLower) {
-        hint = "No match for class '" + args.filterClass + "' (case-insensitive substring · walked " + totalWalked + ') — check spelling';
+        hint = "No match for class '" + args.filterClass + "' (case-insensitive substring · walked " + totalWalked + ' Redux nodes + DOM fallback aussi vide) — check spelling';
       } else if (filterTextLower) {
-        hint = "No match for text '" + args.filterText + "' — text only checked on text-bearing types (Heading, Paragraph, TextLink, Button, Span, Link, NavbarLink, DropdownLink, NavbarBrand, FormBlockLabel, Blockquote) · try filterClass instead";
+        hint = "No match for text '" + args.filterText + "' — text checked on Redux text-bearing types AND DOM canvas fallback (1543 nodes typique). Element probably absent from page or filterText too specific.";
       } else if (filterType) {
         hint = "No node of type '" + args.filterType + "' (walked " + totalWalked + ')';
       }
