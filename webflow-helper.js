@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.2 - 2026-05-20 */
+/* Webflow Helper v3.20.3 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,10 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.3';
+  var VERSION = '3.20.4';
+  // [v3.20.4 (s568)] Fix cleanupUnusedStylesViaUI : pré-check Style Manager état avant
+  // click sidebar button. Le button est un TOGGLE — sans pré-check, 2e call consécutif
+  // fermait le Style Manager au lieu de l'ouvrir. Maintenant skip le click si déjà ouvert.
   // [v3.20.3 (s568)] 2 fixes empiriques cleanup/duplicate :
   // (1) cleanupUnusedStylesViaUI : retiré ESC initial — empiriquement il bloquait le sidebar.click()
   //     suivant. Remplacé par pré-check Enter si mode édit chip détecté.
@@ -4299,15 +4302,19 @@
       await wait(400);
     }
 
-    // 1. Click sur left-sidebar-styles-button (équivalent shortcut G mais DOM cliquable)
-    // Le shortcut G via dispatchEvent KeyboardEvent NE MARCHE PAS (Webflow exige trusted event).
-    var stylesSidebarBtn = document.querySelector('[data-automation-id="left-sidebar-styles-button"]');
-    if (!stylesSidebarBtn) {
-      return { ok: false, error: 'styles_sidebar_button_not_found',
-               message: 'left-sidebar-styles-button absent — Webflow UI may have changed' };
+    // 1. Click sur left-sidebar-styles-button SEULEMENT si Style Manager pas déjà ouvert.
+    // FIX v3.20.4 : le sidebar styles button est un TOGGLE — click ferme si déjà ouvert.
+    // Sans pré-check, le 2e call consécutif fermait le Style Manager au lieu de l'ouvrir.
+    var stylesPanelCheck = document.querySelector('[data-automation-id="styles"]');
+    if (!stylesPanelCheck || stylesPanelCheck.offsetWidth === 0) {
+      var stylesSidebarBtn = document.querySelector('[data-automation-id="left-sidebar-styles-button"]');
+      if (!stylesSidebarBtn) {
+        return { ok: false, error: 'styles_sidebar_button_not_found',
+                 message: 'left-sidebar-styles-button absent — Webflow UI may have changed' };
+      }
+      stylesSidebarBtn.click();
+      await wait(700);
     }
-    stylesSidebarBtn.click();
-    await wait(700);
 
     // 2. Vérifier que le Style Manager s'est ouvert
     var stylesPanel = document.querySelector('[data-automation-id="styles"]');
