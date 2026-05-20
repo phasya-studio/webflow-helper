@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.5 - 2026-05-20 */
+/* Webflow Helper v3.20.6 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,12 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.6';
+  var VERSION = '3.20.7';
+  // [v3.20.7 (s568)] Fix critical : React `onMouseEnter` peut être listé dans Object.keys()
+  // MAIS valeur undefined sur certains chip state (combo chain) → react_props_inaccessible.
+  // Solution : helper `triggerChipHover(chip)` qui tente React puis fallback DOM hover cascade
+  // (mouseover + mouseenter + pointerover up ancestors). Validé empirique : indicator mounte
+  // bien via DOM cascade quand React undefined. Applied aux 3 cmds menu (remove/rename/duplicate).
   // [v3.20.6 (s568)] Fix removeClassFromElementViaUI : detect disabled state du bouton "Remove class".
   // Webflow refuse remove le PARENT d'un combo chain (chip suivi d'autre chip = combo virtuel
   // qui aurait pas d'ancrage). Marqueurs DOM : hasAttribute('disabled') + pointer-events:none.
@@ -3835,6 +3840,30 @@
 
   function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 
+  // Helper: trigger chip hover via React onMouseEnter OU fallback DOM hover cascade (v3.20.7).
+  // FIX empirique : sur certains chip state (combo chain), Object.keys() liste onMouseEnter
+  // MAIS sa valeur est `undefined` → react_props_inaccessible. Fallback : dispatch hover events
+  // sur le chip + 3 ancestors (validé empirique session s568 — indicator se mount).
+  async function triggerChipHover(chip) {
+    var reactKey = Object.keys(chip).find(function(k) { return k.indexOf('__reactProps$') === 0; });
+    var props = reactKey ? chip[reactKey] : null;
+    // Try React onMouseEnter first
+    if (props && typeof props.onMouseEnter === 'function') {
+      try { props.onMouseEnter({ bubbles: true }); return 'react'; } catch (e) {}
+    }
+    // Fallback: DOM hover cascade up ancestors
+    var rect = chip.getBoundingClientRect();
+    var evtOpts = { bubbles: true, view: window, clientX: rect.left + 5, clientY: rect.top + 5 };
+    var el = chip;
+    for (var i = 0; i < 4 && el; i++) {
+      el.dispatchEvent(new PointerEvent('pointerover', Object.assign({}, evtOpts, {pointerType: 'mouse', isPrimary: true})));
+      el.dispatchEvent(new MouseEvent('mouseover', evtOpts));
+      el.dispatchEvent(new MouseEvent('mouseenter', evtOpts));
+      el = el.parentElement;
+    }
+    return 'dom_fallback';
+  }
+
   // Helper: capture les chips de classes actuellement attachées (exclut le chip BP-icon vide)
   function getCurrentChips() {
     var wrappers = Array.from(document.querySelectorAll('[data-automation-id="selector-widget"] [data-automation-id="style-rule-token-wrapper"]'));
@@ -4026,15 +4055,9 @@
     var chip = findChipByName(className);
     if (!chip) return { ok: false, error: 'chip_not_found_after_cleanup', className: className };
 
-    // 2. Trigger React hover to mount menu indicator (dispatchEvent mouseenter ne marche pas)
-    var chipProps = getReactProps(chip);
-    if (!chipProps || typeof chipProps.onMouseEnter !== 'function') {
-      return { ok: false, error: 'react_props_inaccessible',
-               message: 'Webflow React internals may have changed (look for __reactProps$ key)' };
-    }
-    try { chipProps.onMouseEnter({ bubbles: true }); }
-    catch (e) { return { ok: false, error: 'onMouseEnter_threw', message: e.message }; }
-    await wait(400);
+    // 2. Trigger chip hover via React onMouseEnter (preferred) OR DOM cascade fallback (v3.20.7).
+    var hoverMethod = await triggerChipHover(chip);
+    await wait(500);
 
     // 3. Click menu indicator (.click() NATIF — dispatchEvent click est intercepté par overlays)
     var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
@@ -4131,13 +4154,9 @@
     var chip = findChipByName(oldName);
     if (!chip) return { ok: false, error: 'chip_not_found', oldName: oldName };
 
-    // 2. React hover + indicator click
-    var chipProps = getReactProps(chip);
-    if (!chipProps || typeof chipProps.onMouseEnter !== 'function') {
-      return { ok: false, error: 'react_props_inaccessible' };
-    }
-    chipProps.onMouseEnter({ bubbles: true });
-    await wait(400);
+    // 2. Hover via React or DOM cascade fallback (v3.20.7)
+    await triggerChipHover(chip);
+    await wait(500);
 
     var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
     if (!indicator) return { ok: false, error: 'menu_indicator_not_mounted' };
@@ -4243,14 +4262,9 @@
     var chip = findChipByName(className);
     if (!chip) return { ok: false, error: 'chip_not_found_after_cleanup', className: className };
 
-    // 2. React onMouseEnter to mount menu indicator
-    var chipProps = getReactProps(chip);
-    if (!chipProps || typeof chipProps.onMouseEnter !== 'function') {
-      return { ok: false, error: 'react_props_inaccessible' };
-    }
-    try { chipProps.onMouseEnter({ bubbles: true }); }
-    catch (e) { return { ok: false, error: 'onMouseEnter_threw', message: e.message }; }
-    await wait(400);
+    // 2. Hover via React or DOM cascade fallback (v3.20.7)
+    await triggerChipHover(chip);
+    await wait(500);
 
     // 3. Click indicator
     var indicator = chip.querySelector('[data-automation-id="style-rule-token-menu-indicator"]');
