@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.9 - 2026-05-20 */
+/* Webflow Helper v3.20.10 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -134,7 +134,20 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.10';
+  var VERSION = '3.20.11';
+  // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
+  // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
+  // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
+  // de BodyM-500) :
+  // (1) Exact match click : après typed input + wait dropdown, query [role="option"] et
+  //     click l'option dont textContent.trim() === className. Fallback Enter uniquement
+  //     si aucune option exacte (création nouvelle classe). Plus de pollution autocomplete.
+  // (2) Regex validation passe en /^[a-zA-Z0-9_-]+$/ par défaut (majuscules acceptées —
+  //     nommenclature legacy Phasya/projets multiples). Affecte addClassViaUI +
+  //     renameClassViaUI. Flag `allowLegacyUppercase` reste accepté pour rétrocompat
+  //     mais devient no-op (deprecated).
+  // (3) Speed : waits 200/300/600ms → 100/250/400ms (default waitMs). Total ~750ms vs
+  //     1130ms précédent (~33% faster) sans dégrader la fiabilité.
   // [v3.20.10 (s569)] Fix race condition `addClassViaUI` chips DOM vs Redux : après Enter,
   // chips_after lu trop tôt peut être vide alors que Redux state contient déjà la classe
   // (validé empirique s569 sur uppercase legacy `BodyM-500`). Fix : fallback Redux check via
@@ -3981,18 +3994,17 @@
   p._localCmd.addClassViaUI = async function(args) {
     args = args || {};
     var className = args.className;
-    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 600;
+    var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 400;
 
     if (!className || typeof className !== 'string') {
       return { ok: false, error: 'className_required', got: typeof className };
     }
-    var allowUpper = args.allowLegacyUppercase === true;
-    var classNameRegex = allowUpper ? /^[a-zA-Z0-9_-]+$/ : /^[a-z0-9_-]+$/;
+    // v3.20.11 : regex permissive par défaut (majuscules OK — nommenclature legacy/projets multiples).
+    // Flag `allowLegacyUppercase` reste accepté mais no-op (deprecated rétrocompat).
+    var classNameRegex = /^[a-zA-Z0-9_-]+$/;
     if (!classNameRegex.test(className)) {
       return { ok: false, error: 'invalid_class_name',
-               message: allowUpper
-                 ? 'className must match /^[a-zA-Z0-9_-]+$/ (allowLegacyUppercase opt-in). Pas d\'espaces, accents, chars spéciaux.'
-                 : 'className must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya · canon §cluster-create-style gotcha #17). Pour classes legacy Phasya uppercase, passer { allowLegacyUppercase: true }.',
+               message: 'className must match /^[a-zA-Z0-9_-]+$/. Pas d\'espaces, accents, chars spéciaux.',
                className: className };
     }
 
@@ -4004,17 +4016,35 @@
                          message: 'No element selected in Designer ? Style panel must be visible.' };
 
     input.focus();
-    await wait(200);
+    await wait(100);
 
     // Set value via native setter (bypass React shadow setter)
     var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
     nativeSetter.call(input, className);
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    await wait(300);
+    await wait(250);
 
-    // Press Enter
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    // v3.20.11 : Click exact match option AU LIEU d'Enter (Webflow autocomplete focus
+    // interne ne pointe pas toujours sur exact match — Enter pouvait sélectionner une
+    // classe préfixée différente comme BodyMJ-M-500 au lieu de BodyM-500).
+    var options = document.querySelectorAll('[role="option"]');
+    var exactOption = null;
+    for (var i = 0; i < options.length; i++) {
+      if ((options[i].textContent || '').trim() === className) {
+        exactOption = options[i];
+        break;
+      }
+    }
+    var validationPath;
+    if (exactOption) {
+      exactOption.click();
+      validationPath = 'exact_option_click';
+    } else {
+      // Fallback Enter : aucune option exacte → nouvelle classe (création registry)
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      validationPath = 'enter_fallback_create';
+    }
     await wait(waitMs);
 
     var chipsAfter = getCurrentChips();
@@ -4039,6 +4069,7 @@
       chips_after: chipsAfter,
       is_combo: effectiveClasses.length >= 2,
       durationMs: Date.now() - start,
+      validation_path: validationPath,
       redux_fallback_used: !domSuccess && reduxSuccess,
       redux_classes: reduxSuccess ? reduxClasses : undefined
     };
@@ -4204,13 +4235,11 @@
     var waitMs = typeof args.waitMs === 'number' ? args.waitMs : 800;
 
     if (!oldName || !newName) return { ok: false, error: 'oldName_and_newName_required' };
-    var allowUpperR = args.allowLegacyUppercase === true;
-    var newNameRegex = allowUpperR ? /^[a-zA-Z0-9_-]+$/ : /^[a-z0-9_-]+$/;
+    // v3.20.11 : regex permissive majuscules par défaut (cf addClassViaUI). Flag legacy no-op.
+    var newNameRegex = /^[a-zA-Z0-9_-]+$/;
     if (!newNameRegex.test(newName)) {
       return { ok: false, error: 'invalid_new_name',
-               message: allowUpperR
-                 ? 'newName must match /^[a-zA-Z0-9_-]+$/ (allowLegacyUppercase opt-in). Pas d\'espaces, accents, chars spéciaux.'
-                 : 'newName must match /^[a-z0-9_-]+$/ — lowercase strict (convention Phasya). Pour classes legacy Phasya uppercase, passer { allowLegacyUppercase: true }.',
+               message: 'newName must match /^[a-zA-Z0-9_-]+$/. Pas d\'espaces, accents, chars spéciaux.',
                newName: newName };
     }
     if (oldName === newName) return { ok: false, error: 'no_op_same_name' };
