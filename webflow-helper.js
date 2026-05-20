@@ -134,7 +134,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.14.3';
+  var VERSION = '3.15.0';
   // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
   // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
   // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
@@ -3521,6 +3521,88 @@
   console.log('[HelpEditImagesAltInComponent] 1 command registered: helpEditImagesAltInComponent (batch alt edit inside Component view — v3.11.0)');
 })();
 
+// ============================================================================
+// Canvas scroll — v3.15.0 (s565)
+// ============================================================================
+// Cmd: scrollToElement({selector?, data_w_id?, behavior?, block?, wait_ms?})
+//
+// Scroll the Webflow Designer canvas iframe (#site-iframe-next) to bring a target
+// element into view. The canvas iframe is same-origin with the Designer (Webflow
+// uses document.domain trick), so direct DOM access works without React fiber.
+//
+// Webflow's CanvasScrollStore syncs automatically via the iframe's scroll event
+// listener — no Redux dispatch needed.
+//
+// Validated empirically (s565) : scroll 0 → 17873px in ~250ms with `block: 'center'`.
+// ============================================================================
+(function() {
+  'use strict';
+  if (!window.__webflowHelper) return;
+  var p = window.__webflowHelper;
+  if (!p._localCmd) p._localCmd = {};
+
+  p._localCmd.scrollToElement = async function(args) {
+    args = args || {};
+
+    var iframe = document.querySelector('#site-iframe-next');
+    if (!iframe) {
+      return { ok: false, error: 'canvas_iframe_not_found',
+               message: 'Selector #site-iframe-next absent — canvas non monté ou Designer pas chargé' };
+    }
+
+    var doc;
+    try { doc = iframe.contentDocument; }
+    catch (e) { return { ok: false, error: 'cross_origin_blocked', message: e.message }; }
+    if (!doc) return { ok: false, error: 'iframe_document_unavailable' };
+
+    // Resolve selector — accepte `selector` raw OU `data_w_id` shortcut
+    var selector = args.selector;
+    if (!selector && args.data_w_id) {
+      selector = '[data-w-id="' + String(args.data_w_id).replace(/"/g, '\\"') + '"]';
+    }
+    if (!selector) {
+      return { ok: false, error: 'missing_selector_or_data_w_id',
+               message: 'Provide {selector: "h2"} OR {data_w_id: "abc-def-..."}' };
+    }
+
+    var target;
+    try { target = doc.querySelector(selector); }
+    catch (e) { return { ok: false, error: 'invalid_selector', message: e.message, selector: selector }; }
+    if (!target) return { ok: false, error: 'element_not_found', selector: selector };
+
+    var cw = iframe.contentWindow;
+    var behavior = args.behavior === 'instant' ? 'instant' : 'smooth';
+    var validBlocks = { start: 1, center: 1, end: 1, nearest: 1 };
+    var block = validBlocks[args.block] ? args.block : 'center';
+    var waitMs = typeof args.wait_ms === 'number' ? args.wait_ms : (behavior === 'smooth' ? 600 : 250);
+
+    var before = cw.scrollY;
+    try { target.scrollIntoView({ behavior: behavior, block: block }); }
+    catch (e) { return { ok: false, error: 'scrollIntoView_failed', message: e.message }; }
+
+    await new Promise(function(r) { setTimeout(r, waitMs); });
+
+    var after = cw.scrollY;
+    var rect = target.getBoundingClientRect();
+
+    return {
+      ok: true,
+      scrolled_from: before,
+      scrolled_to: after,
+      delta: after - before,
+      target_visible_top: Math.round(rect.top),
+      target_info: {
+        tag: target.tagName,
+        data_w_id: target.getAttribute('data-w-id') || null,
+        id: target.id || null,
+        classes: (target.className || '').toString().slice(0, 100)
+      }
+    };
+  };
+
+  console.log('[ScrollToElement] 1 command registered: scrollToElement (canvas iframe scroll — v3.15.0)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -3541,7 +3623,8 @@
     'getEmbedContent',
     'getEmbedContentViaUI',
     'getCurrentPageInfo',
-    'dumpTree'
+    'dumpTree',
+    'scrollToElement'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
