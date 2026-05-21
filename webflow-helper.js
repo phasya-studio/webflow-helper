@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.10 - 2026-05-20 */
+/* Webflow Helper v3.20.11 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -20,6 +20,18 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.21.0 (s569) : dumpTree `dom_audit` — quand `rootId` scope est utilisé,
+ * cross-check les enfants directs du Redux walk vs DOM iframe canvas et expose les
+ * `dom_only_children: [{id, tag, classes, text, invisible}]` quand divergence.
+ * Cas confirmé empirique AVG (cocktails/buffets/menus/etc.) : Symbol child avec
+ * prop `Visibility=false hasOverride=true` (rendu w-condition-invisible côté
+ * staging) n'apparaît PAS dans `parent.children` Immutable du AbstractNodeStore →
+ * dumpTree({rootId}) retournait 0 enfants au lieu de N+1. Mécanise la détection :
+ * le champ `result.dom_audit.warning` signale la divergence + liste les nodes
+ * manqués (avec leur visibilité). Best-effort ~2-3ms : skip silencieux si l'iframe
+ * canvas n'est pas accessible. Aucun changement comportemental sur le tree retourné
+ * (backward compat) — uniquement ajout d'un champ optionnel `dom_audit`.
  *
  * PATCH v3.14.3 (s567) : updateEmbedViaUI — verify post-save Redux REMPLACÉE par
  * verify CodeMirror pré-save (ground truth instant). Le Redux store local n'est PAS
@@ -134,7 +146,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.20.11';
+  var VERSION = '3.21.0';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -2480,6 +2492,60 @@
     if (expandComponents) result.expanded = expandedCount;
     if (expandSlotOverrides) result.slot_overrides = slotOverridesCount; // v3.3.0
     if (rootIdScope) result.scoped_to = rootIdScope;
+
+    // v3.21.0 — DOM audit pour rootId scope. Détecte les enfants directs visibles
+    // dans le DOM iframe canvas mais absents du walk Redux. Cas confirmé empirique
+    // (s569 AVG cocktails/buffets/menus/etc.) : Symbol children avec prop
+    // `Visibility=false hasOverride=true` rendus `w-condition-invisible` côté staging
+    // n'apparaissent pas dans `parent.children` Immutable du AbstractNodeStore. Sans
+    // ce check, un dumpTree({rootId: row.id}) retourne 0/N enfants au lieu de N+1
+    // → décisions automatiques basées sur le scan ratent les doublons à supprimer.
+    // Best-effort : si l'iframe canvas n'est pas accessible (init bridge en cours),
+    // skip silencieusement — pas de fail. Coût ~2-3ms par call (1 querySelector + N
+    // attribute reads). Le warning est posé dans result.dom_audit, jamais en flat
+    // tree pour ne pas casser les consommateurs existants.
+    if (rootIdScope) {
+      try {
+        var canvas21 = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+        var doc21 = canvas21 && canvas21.contentDocument;
+        if (doc21) {
+          var domRoot = doc21.querySelector('[data-w-id="' + rootIdScope + '"]');
+          if (domRoot) {
+            var domChildIds = [];
+            for (var i21 = 0; i21 < domRoot.children.length; i21++) {
+              var c21 = domRoot.children[i21];
+              var cid = c21.getAttribute('data-w-id');
+              if (cid) domChildIds.push(cid);
+            }
+            var reduxChildIds = {};
+            out.forEach(function(e) {
+              // depth 1 = direct child of rootIdScope (rootIdScope itself = depth 0)
+              // Skip fromTemplate/fromSlotOverride entries (virtual nodes injected
+              // par expandComponents/expandSlotOverrides → pas des enfants réels).
+              if (e.depth === 1 && e.id && !e.fromTemplate && !e.fromSlotOverride) {
+                reduxChildIds[e.id] = true;
+              }
+            });
+            var domOnly = domChildIds.filter(function(id) { return !reduxChildIds[id]; });
+            if (domOnly.length > 0) {
+              result.dom_audit = {
+                warning: 'Redux walk missed ' + domOnly.length + ' direct child(ren) visible in DOM canvas (likely Symbol with prop Visibility=false hasOverride=true → w-condition-invisible)',
+                dom_only_children: domOnly.map(function(id) {
+                  var el = doc21.querySelector('[data-w-id="' + id + '"]');
+                  return {
+                    id: id,
+                    tag: el ? el.tagName : null,
+                    classes: el ? (el.className || '').split(/\s+/).filter(Boolean) : [],
+                    text: el ? (el.textContent || '').trim().slice(0, 80) : null,
+                    invisible: el ? el.classList.contains('w-condition-invisible') : null
+                  };
+                })
+              };
+            }
+          }
+        }
+      } catch (e21) { /* swallow — DOM audit best-effort, no fail */ }
+    }
 
     // v3.17.0 — DOM canvas fallback si Redux walk = 0 match + filter (Text|Class) actif
     // Couvre les cas non-Redux : Symbol inner-text, CMS binding, content injecté par script.
