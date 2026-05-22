@@ -1,4 +1,4 @@
-/* Webflow Helper v3.20.11 - 2026-05-20 */
+/* Webflow Helper v3.21.0 - 2026-05-20 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
@@ -20,6 +20,16 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ *
+ * MINOR v3.22.0 (s571) : dumpTree `direct_children` récap — ajoute en tête du retour
+ * un array compact `direct_children: [{id, type, tag, classes, hidden_on_canvas}]`
+ * + `direct_children_count`. Élimine le pattern récurrent de filtre côté caller
+ * (`tree.filter(n => n.parent_id === rootId)`) + capture les nodes "hidden on canvas"
+ * Designer (œil barré Navigator → `display: none` inline · ex HtmlEmbed page-local
+ * pour CSS/JS scoped). Sinon ces nodes sont noyés dans le DFS du `tree` volumineux
+ * et l'opérateur les rate à la lecture (régression observée 3+ fois s569-s571). Champ
+ * en TÊTE pour forcer la lecture avant de plonger dans tree. Backward compat 100% :
+ * `tree` inchangé. Coût ~2-3ms (DOM iframe canvas inspection N enfants directs).
  *
  * MINOR v3.21.0 (s569) : dumpTree `dom_audit` — quand `rootId` scope est utilisé,
  * cross-check les enfants directs du Redux walk vs DOM iframe canvas et expose les
@@ -146,7 +156,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.21.0';
+  var VERSION = '3.22.0';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -225,7 +235,7 @@
   // sur menu indicator (dispatchEvent click est intercepté par overlays). dispatchEvent
   // KeyboardEvent marche sur INPUT (input add/remove) mais PAS sur contentEditable span
   // (rename via execCommand insertText + InputEvent fallback). Workflows complets validés
-  // empirique session s568 Sandbox AVG. Detail : webflow-helper-canon.md §style-selector-ui-actions.
+  // empirique session s568 Sandbox AVG. Detail : webflow-helper.md §cluster-style-selector-ui.
   // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
   // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
   // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
@@ -807,7 +817,7 @@
    * @param {object} [args.waitMs] Override per-step delays
    * @returns {Promise<object>} `{ ok, id, value, length, lines_read, inComponent, componentInstanceId, durationMs, source: 'codemirror_ui_scrape', error? }`
    *
-   * @see docs/lessons/webflow-helper-canon.md §getembedcontentviaui — empirical workflow
+   * @see docs/lessons/webflow-helper.md §getembedcontentviaui-workflow — empirical workflow
    */
   p._localCmd.getEmbedContentViaUI = async function(args) {
     args = args || {};
@@ -989,7 +999,7 @@
    * @param {object} [args.waitMs]               Override per-step delays (afterDeselect, afterDblClick, afterSelect, afterSettingsTab, afterOpenEditor, afterPaste, afterSave, afterExitComponent)
    * @returns {Promise<object>} `{ ok, success, embedId, expectedLength, actualLength, delta, inComponent, componentInstanceId, durationMs, error? }`
    *
-   * @see docs/lessons/webflow-helper-canon.md §updateembedviaui — reverse-engineered selectors + edge cases (session s547)
+   * @see docs/lessons/webflow-helper.md §updateembedviaui-workflow — reverse-engineered selectors + edge cases (session s547)
    */
   p._localCmd.updateEmbedViaUI = async function(args) {
     args = args || {};
@@ -1263,7 +1273,7 @@
    * @param {object} [args.waitMs]               override per-step delays (afterDeselect, afterSelectParent, afterOpenAddPanel, afterClickEmbed, afterPaste, afterSave)
    * @returns {Promise<object>} `{ ok, success, embedId, parentId, expectedLength, actualLength, delta, durationMs, error? }`
    *
-   * @see docs/lessons/webflow-helper-canon.md §appendhtmlembedviaui
+   * @see docs/lessons/webflow-helper.md §appendhtmlembedviaui-workflow
    */
   p._localCmd.appendHtmlEmbedViaUI = async function(args) {
     args = args || {};
@@ -1411,7 +1421,7 @@
    * @param {object} [args.waitMs]             override per-step delays
    * @returns {Promise<object>} `{ ok, success, nodeId, newName, durationMs, error? }`
    *
-   * @see docs/lessons/webflow-helper-canon.md §renamenode
+   * @see docs/lessons/webflow-helper.md §cluster-rename
    */
   p._localCmd.renameNode = async function(args) {
     args = args || {};
@@ -2140,7 +2150,9 @@
    * @param {string}  [args.rootId]            v1.6.0 — Scope walk to subtree rooted at this node ID (default: body root). Reduces payload 5-10× when working in a known subsection. Returns error if ID not found.
    * @param {boolean} [args.includeParent=true] v3.6.0 — Default true (était false v1.6.0). Adds `parent_id` field to each entry (computed via depth-based stack during walk). Replaces the JS-side `findIndex + walk back` pattern. Only set when not compact. Skipped on virtual nodes from expandComponents. Universal usage: walker générique pour identifier section + variant d'une Image en remontant la chaîne d'ancêtres (au lieu de slice-par-depth qui est cassé par les Symbol expand).
    * @param {boolean} [args.resolveCombo=false] v3.9.0 (s551) — Enrich each entry with `classesResolved: [{id, name, isCombo, parentId?, parentName?}]` alongside the plain `classes` array. Resolves combo classes (10% of names are homonyms in template Phasya, but styleBlockIds are unique). Uses StyleBlockStore.parentIndex (~221 mappings) for O(1) lookup per class. Eliminates the need for MCP `query_elements` style_ids round-trip. ~1ms overhead per node.
-   * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, tree: Array, hint?: string, scoped_to?: string, error?: string }}
+   * @returns {{ ok: boolean, count: number, total_walked: number, expanded?: number, direct_children: Array<{id, type, tag, classes, hidden_on_canvas}>, direct_children_count: number, tree: Array, hint?: string, scoped_to?: string, dom_audit?: object, error?: string }}
+   *
+   * v3.22.0 (s571) `direct_children` + `direct_children_count` : enfants directs du root (depth=1, hors fromTemplate/fromSlotOverride) en tête de retour. Chaque item = {id, type, tag, classes, hidden_on_canvas (display:none inline OR w-condition-invisible OR null si pas dans iframe DOM)}. Skip le pattern caller `tree.filter(parent_id===rootId)` + signale les "hidden on builder" Designer.
    *
    * v1.6.0 hint heuristics: when count===0, the response includes a `hint` field describing the most likely cause (low maxDepth, page not loaded, class spelling, text on non-text-bearing nodes). Empty hint = filter just doesn't match anything.
    */
@@ -2492,6 +2504,46 @@
     if (expandComponents) result.expanded = expandedCount;
     if (expandSlotOverrides) result.slot_overrides = slotOverridesCount; // v3.3.0
     if (rootIdScope) result.scoped_to = rootIdScope;
+
+    // v3.22.0 — direct_children récap : array compact des enfants directs du root
+    // (depth === 1 vs rootIdScope OR vs Body root). Place en TÊTE du retour avec
+    // hidden_on_canvas flag (DOM iframe inspection : display:none inline OR
+    // w-condition-invisible class). Élimine le pattern récurrent de filtre
+    // côté caller `parent_id === rootId` + capture les nodes "hidden in builder"
+    // Designer (œil barré Navigator) noyés sinon dans le DFS du tree volumineux.
+    // Skip les virtual nodes (fromTemplate/fromSlotOverride). Backward compat 100%.
+    var directChildrenRedux = out.filter(function(e) {
+      return e.depth === 1 && !e.fromTemplate && !e.fromSlotOverride;
+    });
+    var canvasDocDC = null;
+    try {
+      var canvasIfDC = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+      canvasDocDC = canvasIfDC && canvasIfDC.contentDocument;
+    } catch (eDC0) { canvasDocDC = null; }
+    result.direct_children = directChildrenRedux.map(function(e) {
+      var item = {
+        id: e.id,
+        type: e.type,
+        tag: e.tag || null,
+        classes: Array.isArray(e.classes) ? e.classes.join(' ') : ''
+      };
+      if (canvasDocDC) {
+        try {
+          var elDC = canvasDocDC.querySelector('[data-w-id="' + e.id + '"]');
+          if (elDC) {
+            var win = elDC.ownerDocument && elDC.ownerDocument.defaultView;
+            var cs = win ? win.getComputedStyle(elDC) : null;
+            var inlineHidden = (cs && cs.display === 'none');
+            var conditionInvisible = elDC.classList.contains('w-condition-invisible');
+            item.hidden_on_canvas = inlineHidden || conditionInvisible || false;
+          } else {
+            item.hidden_on_canvas = null; // not present in iframe DOM
+          }
+        } catch (eDC1) { item.hidden_on_canvas = null; }
+      }
+      return item;
+    });
+    result.direct_children_count = result.direct_children.length;
 
     // v3.21.0 — DOM audit pour rootId scope. Détecte les enfants directs visibles
     // dans le DOM iframe canvas mais absents du walk Redux. Cas confirmé empirique
@@ -3358,7 +3410,8 @@
  *
  * Performance attendue : ~2-3s par image (sélection + open settings + 1-2 dropdowns).
  *
- * @see docs/lessons/webflow-helper-canon.md §setimagesettings (à ajouter)
+ * @see docs/lessons/webflow-helper.md §setimagesettings-workflow (workflow 4 steps · v3.13.0 Enter-key fix)
+ * @see docs/lessons/webflow-helper-canon.md §cmds-whitelist (cheat compact 1-line)
  * @see docs/lessons/webflow-mcp-canon.md §cluster-image-asset (gotcha #34 contourné)
  * ========================================================================= */
 (function setImageSettingsCmd() {
@@ -3921,7 +3974,7 @@
  * GOTCHA menu chip indicator : dispatchEvent click intercepté par overlays Relume/autres.
  *                              Use element.click() NATIF après React onMouseEnter (mount conditionnel).
  *
- * Detail complet : docs/lessons/webflow-helper-canon.md §style-selector-ui-actions
+ * Detail complet : docs/lessons/webflow-helper.md §cluster-style-selector-ui
  */
 (function() {
   'use strict';
