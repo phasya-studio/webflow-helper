@@ -1,7 +1,7 @@
-/* Webflow Helper v3.21.0 - 2026-05-20 */
+/* Webflow Helper v3.23.0 - 2026-05-22 */
 
 /**
- * Webflow Helper — minimal surface, exposes 14 cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 14+ cmds via `__webflowHelper.run()`:
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
@@ -20,6 +20,35 @@
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
  *       (e.g. FAQ items nested in Section FAQ's faq_list slot) + extracts prop values
  *       from `data.sym.overrides[propId][0].data.value` (text format). Read-only.
+ * 15. queryStyleByCombo — resolve combo chain `[parent, combo]` → style_id unique via
+ *     Redux parentIndex local walk (~10ms · 100% reliable). Fix gotcha #41 s572
+ *     (MCP `parent_style_names` silently ignored on homonymous combos ≥2 occurrences).
+ * 16. dumpComboIndex — snapshot Redux registry of homonymous combos (≥2 occurrences
+ *     same name) for git-tracked persistence (`project/webflow-state/combo-registry-{siteId}.json`).
+ *     Consumed by hook PreToolUse style_tool BLOCK (Phase 3 COMBO-DISAMBIGUATION-ROADMAP).
+ *
+ * MINOR v3.23.0 (s572) : 2 nouvelles cmds anti-régression combo homonyme (gotcha #41).
+ * Découvert empirique blog filter bar AVG : MCP `update_style` avec `parent_style_names`
+ * IGNORÉ silencieusement quand combo homonyme existe ≥2 occurrences au registry — hit la
+ * mauvaise combo (pollution navbar `.menu_nav-sublink.is-active` au lieu de blog filter).
+ * Régression vs canon #20 s533 (sandbox testait `button-primary`/`__test_X` → filter OK).
+ *
+ * (a) `queryStyleByCombo({chain})` walk `_webflow.getStoreState('StyleBlockStore').get('parentIndex')`
+ *     Immutable Map (combo_id → parent_id · ~232 mappings AVG), filtre styleBlocks par
+ *     terminal name, chain match via reverse walk parentIndex. Retour {ok, found_count,
+ *     matches, unique_id, ambiguous}. POC validé empirique s572.
+ *
+ * (b) `dumpComboIndex()` itère tous styleBlocks, group par name, ne garde que les ≥2
+ *     occurrences (= à risque #41), résout parent chain complète par entry. Retour
+ *     {ok, site_id, generated_at, helper_version, total_styles, combo_names_count,
+ *     parent_index_size, registry}. Consommé par hook PostToolUse qui écrit le fichier
+ *     git-tracké `project/webflow-state/combo-registry-{siteId}.json`.
+ *
+ * Workflow safe canonique : queryStyleByCombo → MCP update_style → VERIFY style_id
+ * retourné = expected → ROLLBACK si mismatch. Mécanisé Phase 3 roadmap par hook
+ * PreToolUse `webflow-style-combo-block-pretool.py` qui BLOCK les calls non-précédés
+ * d'un queryStyleByCombo sur classe ∈ registre. Détail : `docs/lessons/webflow-mcp.md
+ * §combo-disambiguation-safe-pattern` + `COMBO-DISAMBIGUATION-ROADMAP.md`.
  *
  * MINOR v3.22.0 (s571) : dumpTree `direct_children` récap — ajoute en tête du retour
  * un array compact `direct_children: [{id, type, tag, classes, hidden_on_canvas}]`
@@ -156,7 +185,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.22.0';
+  var VERSION = '3.23.0';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -2646,6 +2675,293 @@
 })();
 
 /**
+ * ComboDisambiguation — resolve homonymous combos via Redux parentIndex local walk.
+ *
+ * Cmds: queryStyleByCombo, dumpComboIndex.
+ *
+ * Fix gotcha #41 s572 : MCP `style_tool.update_style`/`remove_style` ignore silently
+ * `parent_style_names` filter when combo homonyme exists ≥2 occurrences at registry
+ * (validé empirique blog filter bar AVG : `update_style is-active parent=blog_radio-filter`
+ * → MCP hit `menu_nav-sublink.is-active` (navbar) au lieu de `blog_radio-filter.is-active`).
+ *
+ * Workflow safe canonique : queryStyleByCombo(chain) → expected_id · MCP update_style ·
+ * VERIFY returned_id === expected_id · ROLLBACK si mismatch.
+ *
+ * @see docs/lessons/webflow-mcp-canon.md §gotchas-table #41
+ * @see docs/lessons/webflow-mcp.md §combo-disambiguation-safe-pattern
+ * @see COMBO-DISAMBIGUATION-ROADMAP.md
+ */
+(function() {
+  'use strict';
+
+  if (!window.__webflowHelper || !window.__webflowHelper._localCmd) {
+    console.log('[ComboDisambiguation] __webflowHelper not initialized — module skipped');
+    return;
+  }
+
+  var p = window.__webflowHelper;
+  var helpers = p._internal && p._internal.helpers;
+  if (!helpers) {
+    console.log('[ComboDisambiguation] core-helpers not loaded — cmds disabled');
+    return;
+  }
+
+  // ============================================================
+  // Helpers — Immutable.Map OR plain object access (defensive)
+  // ============================================================
+
+  function getStyleBlocksAndParentIndex() {
+    try {
+      var state = helpers.getReduxState();
+      var sbStore = state && state.StyleBlockStore;
+      if (!sbStore || !sbStore.get) return null;
+      var blocks = sbStore.get('styleBlocks');
+      var pi = sbStore.get('parentIndex');
+      if (!blocks || !pi) return null;
+      return { styleBlocks: blocks, parentIndex: pi };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function getName(sb) {
+    if (!sb) return null;
+    if (typeof sb.get === 'function') return sb.get('name');
+    return sb.name || null;
+  }
+
+  function getIsCombo(sb) {
+    if (!sb) return false;
+    if (typeof sb.get === 'function') return !!sb.get('isCombo');
+    return !!sb.isCombo;
+  }
+
+  function piGet(pi, id) {
+    if (!pi) return null;
+    if (typeof pi.get === 'function') return pi.get(id);
+    return pi[id] || null;
+  }
+
+  function sbGet(blocks, id) {
+    if (!blocks) return null;
+    if (typeof blocks.get === 'function') return blocks.get(id);
+    return blocks[id] || null;
+  }
+
+  function sbForEach(blocks, fn) {
+    if (!blocks) return;
+    if (typeof blocks.forEach === 'function') {
+      blocks.forEach(function(sb, id) { fn(sb, id); });
+    } else {
+      Object.keys(blocks).forEach(function(id) { fn(blocks[id], id); });
+    }
+  }
+
+  function piSize(pi) {
+    if (!pi) return 0;
+    if (typeof pi.size === 'number') return pi.size;
+    return Object.keys(pi).length;
+  }
+
+  // ============================================================
+  // Helper — resolve full parent chain (innermost first, anti-loop safety)
+  // ============================================================
+
+  function resolveParentChain(id, styleBlocks, parentIndex) {
+    var chain = [];
+    var currentId = id;
+    var safety = 10; // combo depth ≥10 = abuse
+    while (safety-- > 0) {
+      var parentId = piGet(parentIndex, currentId);
+      if (!parentId) break;
+      var parentBlock = sbGet(styleBlocks, parentId);
+      var parentName = getName(parentBlock);
+      if (!parentName) break;
+      chain.push({ style_id: parentId, name: parentName });
+      currentId = parentId;
+    }
+    return chain;
+  }
+
+  // ============================================================
+  // Helper — verify a chain matches a given style_id (terminal)
+  // chain = [parent_name(s)..., combo_name] (outermost → innermost)
+  // ============================================================
+
+  function chainMatches(id, chain, styleBlocks, parentIndex) {
+    var targetName = chain[chain.length - 1];
+    var sb = sbGet(styleBlocks, id);
+    if (getName(sb) !== targetName) return null;
+
+    var parentNames = chain.slice(0, -1).reverse(); // innermost first
+    var currentId = id;
+    var resolvedParents = [];
+
+    for (var i = 0; i < parentNames.length; i++) {
+      var expectedParent = parentNames[i];
+      var parentId = piGet(parentIndex, currentId);
+      if (!parentId) return null;
+      var parentBlock = sbGet(styleBlocks, parentId);
+      var parentName = getName(parentBlock);
+      if (parentName !== expectedParent) return null;
+      resolvedParents.push({ style_id: parentId, name: parentName });
+      currentId = parentId;
+    }
+
+    return {
+      style_id: id,
+      name: targetName,
+      isCombo: getIsCombo(sb),
+      parent_chain: resolvedParents
+    };
+  }
+
+  // ============================================================
+  // CMD: queryStyleByCombo({chain})
+  // ============================================================
+  // chain = ['parent-name', 'combo-name'] OR ['grandparent', 'parent', 'combo']
+  // (outermost → innermost · terminal = the combo to resolve)
+  // Returns {ok, chain, found_count, matches, unique_id, ambiguous}
+  // ============================================================
+
+  p._localCmd.queryStyleByCombo = function(args) {
+    args = args || {};
+    var chain = args.chain;
+    if (!Array.isArray(chain) || chain.length === 0) {
+      return {
+        ok: false,
+        error: 'invalid_chain',
+        message: 'args.chain must be a non-empty array of names (e.g. ["blog_radio-filter", "is-active"])'
+      };
+    }
+
+    // Sanity: every chain element must be a non-empty string
+    for (var i = 0; i < chain.length; i++) {
+      if (typeof chain[i] !== 'string' || chain[i].length === 0) {
+        return {
+          ok: false,
+          error: 'invalid_chain_element',
+          message: 'chain[' + i + '] must be a non-empty string (got: ' + JSON.stringify(chain[i]) + ')'
+        };
+      }
+    }
+
+    var data = getStyleBlocksAndParentIndex();
+    if (!data) {
+      return {
+        ok: false,
+        error: 'redux_unavailable',
+        message: 'StyleBlockStore not loaded — Designer not ready or Bridge not active?'
+      };
+    }
+
+    var styleBlocks = data.styleBlocks;
+    var parentIndex = data.parentIndex;
+    var targetName = chain[chain.length - 1];
+    var matches = [];
+
+    // Walk only style blocks whose name matches the terminal — skip parent-chain check
+    // for blocks that can't possibly match (perf win on large registry).
+    sbForEach(styleBlocks, function(sb, id) {
+      if (getName(sb) !== targetName) return;
+      var match = chainMatches(id, chain, styleBlocks, parentIndex);
+      if (match) matches.push(match);
+    });
+
+    return {
+      ok: true,
+      chain: chain,
+      found_count: matches.length,
+      matches: matches,
+      unique_id: matches.length === 1 ? matches[0].style_id : null,
+      ambiguous: matches.length > 1
+    };
+  };
+
+  // ============================================================
+  // CMD: dumpComboIndex()
+  // ============================================================
+  // Snapshot Redux : iterate styleBlocks, group by name, keep only
+  // names with ≥2 occurrences (= homonymous combos at risk for #41).
+  // For each homonymous combo, expose parent chain.
+  // Returns {ok, site_id, generated_at, helper_version, total_styles,
+  //          combo_names_count, parent_index_size, registry}.
+  // ============================================================
+
+  p._localCmd.dumpComboIndex = function() {
+    var data = getStyleBlocksAndParentIndex();
+    if (!data) {
+      return {
+        ok: false,
+        error: 'redux_unavailable',
+        message: 'StyleBlockStore not loaded — Designer not ready or Bridge not active?'
+      };
+    }
+
+    var styleBlocks = data.styleBlocks;
+    var parentIndex = data.parentIndex;
+
+    // Step 1: build name → [entries]
+    var byName = {};
+    var totalStyles = 0;
+
+    sbForEach(styleBlocks, function(sb, id) {
+      totalStyles++;
+      var name = getName(sb);
+      if (!name) return;
+      if (!byName[name]) byName[name] = [];
+
+      var parentChain = resolveParentChain(id, styleBlocks, parentIndex);
+
+      byName[name].push({
+        style_id: id,
+        name: name,
+        isCombo: getIsCombo(sb),
+        parent_id: parentChain.length > 0 ? parentChain[0].style_id : null,
+        parent_name: parentChain.length > 0 ? parentChain[0].name : null,
+        parent_chain: parentChain
+      });
+    });
+
+    // Step 2: filter to ≥2 occurrences (homonymous = at risk for #41)
+    var registry = {};
+    var comboNamesCount = 0;
+    Object.keys(byName).forEach(function(name) {
+      if (byName[name].length >= 2) {
+        registry[name] = byName[name];
+        comboNamesCount++;
+      }
+    });
+
+    // Step 3: detect siteId from SiteDataStore (best-effort)
+    var siteId = null;
+    try {
+      var stores = helpers.getStores();
+      var sds = stores && stores.SiteDataStore;
+      if (sds && sds.state) {
+        siteId = sds.state.siteId ||
+                 sds.state.site_id ||
+                 (sds.state.site && sds.state.site.id) ||
+                 null;
+      }
+    } catch (e) { /* fail-soft, siteId may be null */ }
+
+    return {
+      ok: true,
+      site_id: siteId,
+      generated_at: new Date().toISOString(),
+      helper_version: '3.23.0',
+      total_styles: totalStyles,
+      combo_names_count: comboNamesCount,
+      parent_index_size: piSize(parentIndex),
+      registry: registry
+    };
+  };
+
+  console.log('[ComboDisambiguation] 2 commands registered: queryStyleByCombo, dumpComboIndex');
+})();
+
+/**
  * Launch Bridge — `__webflowHelper.launchBridgeApp` mounts the Webflow MCP
  * Bridge App via direct dispatch of `EXTENSION_OPEN`. Auto-resolves the appId
  * from `AppsStore.installedApps[*]` so no hard-coded hash needed.
@@ -4696,7 +5012,9 @@
     'removeClassFromElementViaUI',
     'renameClassViaUI',
     'duplicateClassViaUI',
-    'cleanupUnusedStylesViaUI'
+    'cleanupUnusedStylesViaUI',
+    'queryStyleByCombo',
+    'dumpComboIndex'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
