@@ -1,4 +1,4 @@
-/* Webflow Helper v3.24.0 - 2026-05-23 */
+/* Webflow Helper v3.25.0 - 2026-05-23 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14+ cmds via `__webflowHelper.run()`:
@@ -30,6 +30,16 @@
  * 16. dumpComboIndex — snapshot Redux registry of homonymous combos (≥2 occurrences
  *     same name) for git-tracked persistence (`project/webflow-state/combo-registry-{siteId}.json`).
  *     Consumed by hook PreToolUse style_tool BLOCK (Phase 3 COMBO-DISAMBIGUATION-ROADMAP).
+ * 17. selectNode — select any Navigator node via NODE_CLICKED dispatch (auto-expands the
+ *     Navigator; works for collapsed nodes). Intra-component: pass componentInstanceId. (v3.25.0)
+ * 18. openComponentView — enter a component edit view via SYMBOL_NODE_FOCUSED dispatch
+ *     (derives symbolId from the Symbol node's .componentInstance). (v3.25.0)
+ * 19. closeComponentView — exit a component edit view via SYMBOL_NODE_UNFOCUSED dispatch. (v3.25.0)
+ *
+ * MINOR v3.25.0 (s573) : 3 cmds Navigator selection + component-view enter/exit, reverse-eng'd
+ * via dispatch interception. Native UI actions (selection/navigation), NOT document mutations —
+ * whitelisted by exact action type in `.claude/hooks/_webflow-redux-whitelist.json`. Solves the
+ * MCP gap: selecting an arbitrary node (incl. collapsed / intra-component) + entering a component.
  *
  * MINOR v3.24.0 (s572) : `getEmbedContent` (Redux SYNC) supprimée · `getEmbedContentViaUI`
  * devient l'unique cmd publique de lecture d'embed. La voie Redux retournait `value: ""`
@@ -198,7 +208,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.24.0';
+  var VERSION = '3.25.0';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -3265,6 +3275,11 @@
 // 7. getEmbedContent - MCP gap (single embed content read)
 // 8. getCurrentPageInfo - 3-source page concordance check (MCP de_page_tool.get_current_page has 76% timeout + no DOM/URL cross-check)
 // 9. dumpTree - full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
+// + (v3.25.0 s573) selectNode, openComponentView, closeComponentView — Navigator
+//   selection + component-view enter/exit via Redux dispatch (NODE_CLICKED /
+//   SYMBOL_NODE_FOCUSED / SYMBOL_NODE_UNFOCUSED). MCP gap: no way to select an
+//   arbitrary node (esp. collapsed/intra-component) nor enter a component view.
+//   (List above is historical; full set lives in ALLOWED_CMDS array below.)
 //
 // NOTE v3.0.0 : setEmbedHasScript retirée (redundant — Webflow auto-pose le flag w-script
 // au Save UI quand le content contient `<script>`).
@@ -4972,6 +4987,115 @@
   console.log('[StyleSelectorUI] 6 commands registered: addClassViaUI · removeLastClassViaUI · removeClassFromElementViaUI · renameClassViaUI · duplicateClassViaUI · cleanupUnusedStylesViaUI (v3.20.0 s568)');
 })();
 
+/**
+ * Navigator Selection & Component View — 3 cmds via Redux dispatch (v3.25.0 s573).
+ *
+ * Reverse-eng'd via dispatch interception (capture of native Webflow actions, no
+ * fabricated payloads — the payloads mirror exactly what Webflow emits on click) :
+ * - selectNode         → NODE_CLICKED         (selection + auto-expand/scroll Navigator)
+ * - openComponentView  → SYMBOL_NODE_FOCUSED   (enter component edit view; "Symbol" = component)
+ * - closeComponentView → SYMBOL_NODE_UNFOCUSED (exit component edit view; no payload)
+ *
+ * These are NAVIGATION/SELECTION actions (ephemeral UI state), NOT document
+ * mutations — categorically distinct from EXPRESSION_ACTION (which corrupted the
+ * mariage page s549). Whitelisted by exact action type in
+ * `.claude/hooks/_webflow-redux-whitelist.json`. Validated empirically s573 :
+ * styleBlocks count unchanged (992→992), invalid id fails gracefully ("None
+ * selected"), full open→select-child→close cycle OK on Footer component.
+ *
+ * Intra-component selection requires being INSIDE the component view first:
+ *   openComponentView({instanceNativeId}) → selectNode({nodeId, componentInstanceId}) → closeComponentView()
+ */
+(function() {
+  'use strict';
+
+  if (!window.__webflowHelper || !window.__webflowHelper._localCmd) {
+    console.log('[NavSelect] __webflowHelper not initialized — module skipped');
+    return;
+  }
+  var p = window.__webflowHelper;
+
+  function selectedTitle() {
+    var t = document.querySelector('[data-automation-id="selected-node-title-label"]');
+    return t ? t.textContent.trim() : null;
+  }
+  function inComponentView() {
+    var b = document.querySelector('[data-automation-id="unfocus-component-button"]');
+    return !!b && b.getBoundingClientRect().width > 0;
+  }
+  function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  // selectNode({nodeId, componentInstanceId?, waitMs?})
+  // Page node → nativeIdPath:[nodeId] (auto-expands the Navigator to reveal it).
+  // Intra-component node → nativeIdPath:[componentInstanceId, nodeId] — but you must
+  // be INSIDE that component view first (call openComponentView).
+  p._localCmd.selectNode = async function(args) {
+    args = args || {};
+    var nodeId = args.nodeId;
+    var componentInstanceId = args.componentInstanceId || null;
+    var waitMs = (args.waitMs && args.waitMs.afterSelect) || 500;
+    if (!nodeId) return { ok: false, error: 'nodeId required' };
+    var wf = window._webflow;
+    if (!wf || !wf.dispatch) return { ok: false, error: 'Webflow store/dispatch not accessible' };
+    var start = Date.now();
+    var path = componentInstanceId ? [componentInstanceId, nodeId] : [nodeId];
+    wf.dispatch({ type: 'NODE_CLICKED', payload: { nativeIdPath: path, isMultiSelectModifierKeyActive: false, source: 'navigator', nativeIdInCurrentComponent: nodeId } });
+    await wait(waitMs);
+    var uiNode = wf.stores && wf.stores.UiNodeStore;
+    var selId = uiNode && uiNode.state ? uiNode.state.selectedNodeNativeId : null;
+    var title = selectedTitle();
+    // Valid selection = store holds our id AND a real title is shown.
+    // (selectedNodeNativeId alone accepts any string — an invalid id yields title "None selected".)
+    var ok = selId === nodeId && !!title && title !== 'None selected';
+    return {
+      ok: ok, nodeId: nodeId, componentInstanceId: componentInstanceId,
+      selected: selId, title: title, durationMs: Date.now() - start,
+      error: ok ? undefined : (selId === nodeId ? 'node does not exist (title=None selected)' : 'selection did not land — for intra-component nodes call openComponentView first')
+    };
+  };
+
+  // openComponentView({instanceNativeId, symbolId?, waitMs?})
+  // Enters the component edit view. Derives symbolId from the Symbol node's
+  // `.componentInstance` field (via dumpTree) when not supplied.
+  p._localCmd.openComponentView = async function(args) {
+    args = args || {};
+    var instanceNativeId = args.instanceNativeId;
+    var symbolId = args.symbolId || null;
+    var waitMs = (args.waitMs && args.waitMs.afterOpen) || 700;
+    if (!instanceNativeId) return { ok: false, error: 'instanceNativeId required' };
+    var wf = window._webflow;
+    if (!wf || !wf.dispatch) return { ok: false, error: 'Webflow store/dispatch not accessible' };
+    if (!symbolId) {
+      try {
+        var tree = await p._localCmd.dumpTree({ expandComponents: true });
+        var sym = (tree.tree || []).find(function(n) { return n.id === instanceNativeId && n.type === 'Symbol'; });
+        if (sym && sym.componentInstance) symbolId = sym.componentInstance;
+      } catch (e) { /* fall through to error below */ }
+      if (!symbolId) return { ok: false, error: 'could not derive symbolId — ' + instanceNativeId + ' is not a Symbol instance in the tree (pass symbolId explicitly)' };
+    }
+    var start = Date.now();
+    wf.dispatch({ type: 'SYMBOL_NODE_FOCUSED', payload: { id: symbolId, instanceNativeId: instanceNativeId, analytics: { source: 'props panel', trigger: 'click', symbolId: symbolId } } });
+    await wait(waitMs);
+    var entered = inComponentView();
+    return { ok: entered, instanceNativeId: instanceNativeId, symbolId: symbolId, durationMs: Date.now() - start, error: entered ? undefined : 'failed to enter component view' };
+  };
+
+  // closeComponentView({waitMs?}) — exits the component edit view (no payload).
+  p._localCmd.closeComponentView = async function(args) {
+    args = args || {};
+    var waitMs = (args.waitMs && args.waitMs.afterClose) || 600;
+    var wf = window._webflow;
+    if (!wf || !wf.dispatch) return { ok: false, error: 'Webflow store/dispatch not accessible' };
+    var start = Date.now();
+    wf.dispatch({ type: 'SYMBOL_NODE_UNFOCUSED' });
+    await wait(waitMs);
+    var stillIn = inComponentView();
+    return { ok: !stillIn, durationMs: Date.now() - start, error: stillIn ? 'still in component view after unfocus' : undefined };
+  };
+
+  console.log('[NavSelect] 3 commands registered: selectNode, openComponentView, closeComponentView (v3.25.0 s573)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -5001,7 +5125,10 @@
     'duplicateClassViaUI',
     'cleanupUnusedStylesViaUI',
     'queryStyleByCombo',
-    'dumpComboIndex'
+    'dumpComboIndex',
+    'selectNode',
+    'openComponentView',
+    'closeComponentView'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
