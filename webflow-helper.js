@@ -1,4 +1,4 @@
-/* Webflow Helper v3.25.0 - 2026-05-23 */
+/* Webflow Helper v3.25.1 - 2026-05-24 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14+ cmds via `__webflowHelper.run()`:
@@ -208,7 +208,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.25.0';
+  var VERSION = '3.25.1';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -5027,8 +5027,11 @@
 
   // selectNode({nodeId, componentInstanceId?, waitMs?})
   // Page node → nativeIdPath:[nodeId] (auto-expands the Navigator to reveal it).
-  // Intra-component node → nativeIdPath:[componentInstanceId, nodeId] — but you must
-  // be INSIDE that component view first (call openComponentView).
+  // Intra-component node → pass componentInstanceId: the cmd tries a direct select
+  // (works if already inside that component view) and, on failure, AUTO-calls
+  // openComponentView then retries. No need to remember to open the component first —
+  // the gotcha is mechanized. (closeComponentView stays manual: the cmd can't know
+  // when you're done editing. Check `auto_opened_component` in the return.)
   p._localCmd.selectNode = async function(args) {
     args = args || {};
     var nodeId = args.nodeId;
@@ -5038,20 +5041,49 @@
     var wf = window._webflow;
     if (!wf || !wf.dispatch) return { ok: false, error: 'Webflow store/dispatch not accessible' };
     var start = Date.now();
-    var path = componentInstanceId ? [componentInstanceId, nodeId] : [nodeId];
-    wf.dispatch({ type: 'NODE_CLICKED', payload: { nativeIdPath: path, isMultiSelectModifierKeyActive: false, source: 'navigator', nativeIdInCurrentComponent: nodeId } });
-    await wait(waitMs);
     var uiNode = wf.stores && wf.stores.UiNodeStore;
-    var selId = uiNode && uiNode.state ? uiNode.state.selectedNodeNativeId : null;
-    var title = selectedTitle();
-    // Valid selection = store holds our id AND a real title is shown.
-    // (selectedNodeNativeId alone accepts any string — an invalid id yields title "None selected".)
-    var ok = selId === nodeId && !!title && title !== 'None selected';
-    return {
-      ok: ok, nodeId: nodeId, componentInstanceId: componentInstanceId,
-      selected: selId, title: title, durationMs: Date.now() - start,
-      error: ok ? undefined : (selId === nodeId ? 'node does not exist (title=None selected)' : 'selection did not land — for intra-component nodes call openComponentView first')
-    };
+
+    function doSelect() {
+      var path = componentInstanceId ? [componentInstanceId, nodeId] : [nodeId];
+      wf.dispatch({ type: 'NODE_CLICKED', payload: { nativeIdPath: path, isMultiSelectModifierKeyActive: false, source: 'navigator', nativeIdInCurrentComponent: nodeId } });
+    }
+    function checkSel() {
+      var selId = uiNode && uiNode.state ? uiNode.state.selectedNodeNativeId : null;
+      var title = selectedTitle();
+      // Valid = store holds our id AND a real title is shown.
+      // (selectedNodeNativeId alone accepts any string — an invalid id yields "None selected".)
+      return { ok: selId === nodeId && !!title && title !== 'None selected', selId: selId, title: title };
+    }
+
+    // Page node — single dispatch.
+    if (!componentInstanceId) {
+      doSelect();
+      await wait(waitMs);
+      var v = checkSel();
+      return { ok: v.ok, nodeId: nodeId, selected: v.selId, title: v.title, durationMs: Date.now() - start,
+               error: v.ok ? undefined : (v.selId === nodeId ? 'node does not exist (title=None selected)' : 'selection did not land') };
+    }
+
+    // Intra-component node — try direct first (cheap if already inside the component
+    // view), else AUTO-open the component then retry (mechanizes the gotcha).
+    var autoOpened = false;
+    doSelect();
+    await wait(waitMs);
+    var v1 = checkSel();
+    if (!v1.ok) {
+      var openRes = await p._localCmd.openComponentView({ instanceNativeId: componentInstanceId });
+      if (!openRes.ok) {
+        return { ok: false, nodeId: nodeId, componentInstanceId: componentInstanceId, auto_opened_component: false,
+                 durationMs: Date.now() - start, error: 'auto-openComponentView failed: ' + openRes.error };
+      }
+      autoOpened = true;
+      doSelect();
+      await wait(waitMs);
+    }
+    var v2 = checkSel();
+    return { ok: v2.ok, nodeId: nodeId, componentInstanceId: componentInstanceId, auto_opened_component: autoOpened,
+             selected: v2.selId, title: v2.title, durationMs: Date.now() - start,
+             error: v2.ok ? undefined : 'selection did not land even after auto-openComponentView (node may not exist in this component)' };
   };
 
   // openComponentView({instanceNativeId, symbolId?, waitMs?})
