@@ -1,4 +1,4 @@
-/* Webflow Helper v3.25.1 - 2026-05-24 */
+/* Webflow Helper v3.25.2 - 2026-05-24 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14+ cmds via `__webflowHelper.run()`:
@@ -208,7 +208,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.25.1';
+  var VERSION = '3.25.2';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -3629,7 +3629,12 @@
     var failed = [];
 
     // Validation initiale : panel Properties doit être ouvert (instance sélectionnée préalable).
-    var panel = document.querySelector('[data-automation-id="componentInstanceProperties"]');
+    // v3.25.2 : gate robuste — Webflow a retiré 'componentInstanceProperties' (drift UI s574).
+    // Le panel Settings utilise 'propertiesTab-<defId>-settings' ; les props 'ExpressionEditor-fieldWrapper-<name>'.
+    // On accepte les 3 (ancien + nouveaux) — le dernier est ce que la cmd manipule réellement.
+    var panel = document.querySelector('[data-automation-id="componentInstanceProperties"]')
+             || document.querySelector('[data-automation-id^="propertiesTab-"][data-automation-id$="-settings"]')
+             || document.querySelector('[data-automation-id^="ExpressionEditor-fieldWrapper-"]');
     if (!panel) {
       return {
         ok: false,
