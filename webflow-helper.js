@@ -1,4 +1,4 @@
-/* Webflow Helper v3.23.0 - 2026-05-22 */
+/* Webflow Helper v3.24.0 - 2026-05-23 */
 
 /**
  * Webflow Helper — minimal surface, exposes 14+ cmds via `__webflowHelper.run()`:
@@ -13,8 +13,12 @@
  * 8. helpEditImagesAltInComponent — batch alt mode edit for ComponentInstance children (v3.11.2)
  * 9. findNodeContext — resolve nodeId → MCP id format + component view context (v3.8.0)
  * 10. listEmbeds — list embeds + their contents (no MCP tool)
- * 11. getEmbedContent — fast Redux read of a single embed's content (no MCP tool · may be stale after writes on inComponent — see getEmbedContentViaUI)
- * 12. getEmbedContentViaUI — ground-truth read via CodeMirror UI scrape (~3-4s · 100% reliable post-write inComponent) (v3.14.3)
+ * 11. getEmbedContentViaUI — ground-truth embed read via CodeMirror UI scrape (~3-4s · 100% reliable · async)
+ *     v3.24.0 (s572) — l'ancienne `getEmbedContent` (Redux SYNC) a été supprimée car elle retournait
+ *     `value: ""` faux négatif sur embeds stale post-write inComponent + sur certaines lectures cross-session.
+ *     `getEmbedContentViaUI` devient l'unique interface publique de lecture d'embed — JAMAIS de lecture
+ *     Redux exposée pour le contenu (la stale était trop trompeuse à l'audit). Le suffixe `ViaUI` conservé
+ *     pour cohérence avec `updateEmbedViaUI`, `appendHtmlEmbedViaUI`, etc.
  * 13. getCurrentPageInfo — 3-source page concordance (DOM/URL/Redux) — MCP de_page_tool.get_current_page has 76% timeout + no DOM check
  * 14. dumpTree — full Navigator tree dump with resolved class names (MCP query_elements BETA broken)
  *     + v3.3.0 option `expandSlotOverrides` — walks Component instance slot overrides
@@ -26,6 +30,15 @@
  * 16. dumpComboIndex — snapshot Redux registry of homonymous combos (≥2 occurrences
  *     same name) for git-tracked persistence (`project/webflow-state/combo-registry-{siteId}.json`).
  *     Consumed by hook PreToolUse style_tool BLOCK (Phase 3 COMBO-DISAMBIGUATION-ROADMAP).
+ *
+ * MINOR v3.24.0 (s572) : `getEmbedContent` (Redux SYNC) supprimée · `getEmbedContentViaUI`
+ * devient l'unique cmd publique de lecture d'embed. La voie Redux retournait `value: ""`
+ * faux négatif sur certains embeds non vides (state désynchronisé) — trop trompeuse en
+ * audit. Le suffixe `ViaUI` conservé pour cohérence naming (`updateEmbedViaUI`,
+ * `appendHtmlEmbedViaUI`, etc.) et pour signaler le coût perf ~3-4s par lecture. STEP 8
+ * verify de `appendHtmlEmbedViaUI` adapté : `await p._localCmd.getEmbedContentViaUI(...)`
+ * (ajoute ~3-4s par append, acceptable pour la fiabilité). Breaking pour les callers
+ * directs `p._localCmd.getEmbedContent()` — remplacer par `getEmbedContentViaUI` + await.
  *
  * MINOR v3.23.0 (s572) : 2 nouvelles cmds anti-régression combo homonyme (gotcha #41).
  * Découvert empirique blog filter bar AVG : MCP `update_style` avec `parent_style_names`
@@ -185,7 +198,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.23.0';
+  var VERSION = '3.24.0';
   // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
   // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
   // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
@@ -703,7 +716,7 @@
 /**
  * CodeEmbed — HtmlEmbed read/write via Redux + WebSocket.
  *
- * Cmds: listEmbeds, getEmbedContent, appendHtmlEmbedViaUI, updateEmbedViaUI, renameNode.
+ * Cmds: listEmbeds, getEmbedContentViaUI, appendHtmlEmbedViaUI, updateEmbedViaUI, renameNode.
  *
  * Persistence (UI save reverse-engineered): socket message `siteData:update` with
  * - actionType=HTML_EMBED_TEXT_SAVED
@@ -792,34 +805,6 @@
   };
 
   /**
-   * Read the full content of an embed (FAST · Redux read).
-   *
-   * ⚠️ STALE WARNING (v3.14.3) : The returned `value` comes from local
-   * AbstractNodeStore Redux which is NOT auto-resynced after a successful
-   * `updateEmbedViaUI` on an inComponent embed. The save IS committed server-side
-   * (verified empirically via curl staging post-publish) but the local Redux only
-   * refreshes on Designer reload F5. For guaranteed-fresh reads (especially after
-   * in-session writes on inComponent embeds), use `getEmbedContentViaUI` instead
-   * — slower (~3-4s due to UI modal scrape) but 100% reliable.
-   *
-   * @param {{ embedId: string }} args
-   * @returns {{ ok: boolean, id?: string, value?: string, length?: number, source?: string, error?: string }}
-   */
-  p._localCmd.getEmbedContent = function(args) {
-    var embedId = args.embedId;
-    if (!embedId) return { ok: false, error: 'embedId required' };
-
-    var root = getRoot();
-    var node = helpers.findNodeByIdInTree(root, embedId, { maxDepth: 30 });
-    if (!node) return { ok: false, error: 'Node not found: ' + embedId };
-    if (node.get('type') !== 'HtmlEmbed') return { ok: false, error: 'Node is not an HtmlEmbed: ' + node.get('type') };
-
-    var data = node.get('data');
-    var value = data ? (data.get('value') || '') : '';
-    return { ok: true, id: embedId, value: value, length: value.length, source: 'redux' };
-  };
-
-  /**
    * Read the full content of an embed via UI scrape (SLOW · 100% reliable · ground truth).
    *
    * Workflow (~3-4s native, ~4-5s for inComponent):
@@ -835,11 +820,13 @@
    *   7. Click modal close X (read-only, no Save → no "unsaved" prompt)
    *   8. Exit component view if entered
    *
-   * Use this instead of `getEmbedContent` when :
-   *   - You just called `updateEmbedViaUI` on an inComponent embed and need to
-   *     verify the saved value (Redux is stale, see canon §gotcha-redux-stale-inComponent)
-   *   - You suspect another client/session has modified the embed
-   *   - You need guaranteed-fresh content for critical decisions
+   * v3.24.0 (s572) : devient l'UNIQUE voie de lecture d'embed exposée publiquement.
+   * L'ancienne voie Redux SYNC `getEmbedContent` a été supprimée (retournait `value: ""`
+   * faux négatif sur certains embeds non vides quand le state Redux était désynchronisé
+   * — trop trompeur en audit). Toutes les lectures d'embeds passent désormais par ce
+   * chemin UI scrape, ce qui ajoute ~3-4s par lecture mais garantit la véracité. Le
+   * suffixe `ViaUI` reste pour signaler la méthode et le coût perf (cohérent avec
+   * `updateEmbedViaUI`, `appendHtmlEmbedViaUI`, `addClassViaUI`, etc.).
    *
    * @param {object} args
    * @param {string} args.embedId
@@ -1291,7 +1278,7 @@
    *   5. Capture new embedId via selectedNodeNativeId
    *   6. Paste content via .cm-content + ClipboardEvent
    *   7. Click "Save & Close"
-   *   8. Validate via getEmbedContent
+   *   8. Validate via getEmbedContentViaUI
    *
    * Le flag `w-script` est auto-posé par Webflow au Save UI quand le content contient
    * `<script>` (validé empirique s547) — pas besoin d'appel setEmbedHasScript séparé.
@@ -1404,8 +1391,8 @@
     saveCloseBtn.click();
     await wait(DELAYS.afterSave);
 
-    // STEP 8: Validate via getEmbedContent
-    var verify = p._localCmd.getEmbedContent({ embedId: newEmbedId });
+    // STEP 8: Validate via getEmbedContentViaUI (unique voie de lecture depuis v3.24.0 · async)
+    var verify = await p._localCmd.getEmbedContentViaUI({ embedId: newEmbedId });
     var success = !!(verify && verify.ok && verify.value === content);
 
     return {
@@ -1547,7 +1534,7 @@
     };
   };
 
-  console.log('[CodeEmbed] 6 commands registered: listEmbeds, getEmbedContent, getEmbedContentViaUI, appendHtmlEmbedViaUI, updateEmbedViaUI, renameNode.');
+  console.log('[CodeEmbed] 5 commands registered: listEmbeds, getEmbedContentViaUI, appendHtmlEmbedViaUI, updateEmbedViaUI, renameNode.');
 })();
 
 /**
