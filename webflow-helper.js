@@ -1,7 +1,8 @@
 /* Webflow Helper v3.25.2 - 2026-05-24 */
 
 /**
- * Webflow Helper — minimal surface, exposes 14+ cmds via `__webflowHelper.run()`:
+ * Webflow Helper — minimal surface, exposes 25 cmds via `__webflowHelper.run()`
+ * (source of truth = the ALLOWED_CMDS array at the end of this file):
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
  * 2. launchBridgeApp — mount the Webflow MCP Bridge App via direct dispatch
@@ -36,164 +37,10 @@
  *     (derives symbolId from the Symbol node's .componentInstance). (v3.25.0)
  * 19. closeComponentView — exit a component edit view via SYMBOL_NODE_UNFOCUSED dispatch. (v3.25.0)
  *
- * MINOR v3.25.0 (s573) : 3 cmds Navigator selection + component-view enter/exit, reverse-eng'd
- * via dispatch interception. Native UI actions (selection/navigation), NOT document mutations —
- * whitelisted by exact action type in `.claude/hooks/_webflow-redux-whitelist.json`. Solves the
- * MCP gap: selecting an arbitrary node (incl. collapsed / intra-component) + entering a component.
- *
- * MINOR v3.24.0 (s572) : `getEmbedContent` (Redux SYNC) supprimée · `getEmbedContentViaUI`
- * devient l'unique cmd publique de lecture d'embed. La voie Redux retournait `value: ""`
- * faux négatif sur certains embeds non vides (state désynchronisé) — trop trompeuse en
- * audit. Le suffixe `ViaUI` conservé pour cohérence naming (`updateEmbedViaUI`,
- * `appendHtmlEmbedViaUI`, etc.) et pour signaler le coût perf ~3-4s par lecture. STEP 8
- * verify de `appendHtmlEmbedViaUI` adapté : `await p._localCmd.getEmbedContentViaUI(...)`
- * (ajoute ~3-4s par append, acceptable pour la fiabilité). Breaking pour les callers
- * directs `p._localCmd.getEmbedContent()` — remplacer par `getEmbedContentViaUI` + await.
- *
- * MINOR v3.23.0 (s572) : 2 nouvelles cmds anti-régression combo homonyme (gotcha #41).
- * Découvert empirique blog filter bar AVG : MCP `update_style` avec `parent_style_names`
- * IGNORÉ silencieusement quand combo homonyme existe ≥2 occurrences au registry — hit la
- * mauvaise combo (pollution navbar `.menu_nav-sublink.is-active` au lieu de blog filter).
- * Régression vs canon #20 s533 (sandbox testait `button-primary`/`__test_X` → filter OK).
- *
- * (a) `queryStyleByCombo({chain})` walk `_webflow.getStoreState('StyleBlockStore').get('parentIndex')`
- *     Immutable Map (combo_id → parent_id · ~232 mappings AVG), filtre styleBlocks par
- *     terminal name, chain match via reverse walk parentIndex. Retour {ok, found_count,
- *     matches, unique_id, ambiguous}. POC validé empirique s572.
- *
- * (b) `dumpComboIndex()` itère tous styleBlocks, group par name, ne garde que les ≥2
- *     occurrences (= à risque #41), résout parent chain complète par entry. Retour
- *     {ok, site_id, generated_at, helper_version, total_styles, combo_names_count,
- *     parent_index_size, registry}. Consommé par hook PostToolUse qui écrit le fichier
- *     git-tracké `project/webflow-state/combo-registry-{siteId}.json`.
- *
- * Workflow safe canonique : queryStyleByCombo → MCP update_style → VERIFY style_id
- * retourné = expected → ROLLBACK si mismatch. Mécanisé Phase 3 roadmap par hook
- * PreToolUse `webflow-style-combo-block-pretool.py` qui BLOCK les calls non-précédés
- * d'un queryStyleByCombo sur classe ∈ registre. Détail : `docs/lessons/webflow-mcp.md
- * §combo-disambiguation-safe-pattern` + `COMBO-DISAMBIGUATION-ROADMAP.md`.
- *
- * MINOR v3.22.0 (s571) : dumpTree `direct_children` récap — ajoute en tête du retour
- * un array compact `direct_children: [{id, type, tag, classes, hidden_on_canvas}]`
- * + `direct_children_count`. Élimine le pattern récurrent de filtre côté caller
- * (`tree.filter(n => n.parent_id === rootId)`) + capture les nodes "hidden on canvas"
- * Designer (œil barré Navigator → `display: none` inline · ex HtmlEmbed page-local
- * pour CSS/JS scoped). Sinon ces nodes sont noyés dans le DFS du `tree` volumineux
- * et l'opérateur les rate à la lecture (régression observée 3+ fois s569-s571). Champ
- * en TÊTE pour forcer la lecture avant de plonger dans tree. Backward compat 100% :
- * `tree` inchangé. Coût ~2-3ms (DOM iframe canvas inspection N enfants directs).
- *
- * MINOR v3.21.0 (s569) : dumpTree `dom_audit` — quand `rootId` scope est utilisé,
- * cross-check les enfants directs du Redux walk vs DOM iframe canvas et expose les
- * `dom_only_children: [{id, tag, classes, text, invisible}]` quand divergence.
- * Cas confirmé empirique AVG (cocktails/buffets/menus/etc.) : Symbol child avec
- * prop `Visibility=false hasOverride=true` (rendu w-condition-invisible côté
- * staging) n'apparaît PAS dans `parent.children` Immutable du AbstractNodeStore →
- * dumpTree({rootId}) retournait 0 enfants au lieu de N+1. Mécanise la détection :
- * le champ `result.dom_audit.warning` signale la divergence + liste les nodes
- * manqués (avec leur visibilité). Best-effort ~2-3ms : skip silencieux si l'iframe
- * canvas n'est pas accessible. Aucun changement comportemental sur le tree retourné
- * (backward compat) — uniquement ajout d'un champ optionnel `dom_audit`.
- *
- * PATCH v3.14.3 (s567) : updateEmbedViaUI — verify post-save Redux REMPLACÉE par
- * verify CodeMirror pré-save (ground truth instant). Le Redux store local n'est PAS
- * resync après save UI sur embed inComponent (validé empirique : 3 retries × 6.5s sur
- * services 998737ec retournaient `success:false` faux négatif alors que server avait
- * bien stocké le content — confirmé via curl staging). Le seul mécanisme de resync
- * Redux = reload Designer F5. La verify pré-save lit `.cm-line` walk après paste,
- * AVANT click Save & Close — c'est le content qui sera envoyé au server. Tolérance
- * ±2 chars trailing `\n` strip CodeMirror. + Nouvelle cmd `getEmbedContentViaUI`
- * (~3-4s) ouvre modal Code Editor + lit CodeMirror + ferme → ground truth fiable
- * 100% pour lectures post-write inComponent (alternative à `getEmbedContent` rapide
- * mais stale Redux). + Note JSDoc stale warning sur `listEmbeds` et `getEmbedContent`.
- *
- * PATCH v3.13.0 (s557) : setImageSettings — Enter key sequence ajoutée dans applyAlt
- * pour mode='custom' avec altCustomText. v3.7.0 disposait setter React + input + change
- * + blur → texte visible UI MAIS Redux NON-COMMITÉ (alt restait `<inherit>` ou vide
- * en Redux state, malgré retour cmd `applied: ["alt:custom (custom text set)"]`).
- * Pattern repris de helpEditImagesAltInComponent v3.11.0 (validé s552) :
- *   focus → setter.call → input event → Enter keydown/keypress/keyup → blur
- * Validé empirique s557 : 8 zones AVG carte zone livraison alt custom per-zone
- * (autour de Vernon — service à [Évreux/Rouen/Louviers/...]) → tous propagés Redux
- * + DOM HTML staging post-publish + cache buster. Bug détecté pendant audit content
- * /content-audit louviers item 4 (alt carte zone livraison per-zone).
- *
- * MINOR v3.10.0 (s549) : updateEmbedViaUI — fingerprint fallback resolution.
- * Quand embedId ne trouve aucun match dans le canvas DOM (ID volatile : Webflow
- * regenere les IDs au delete+recreate ou refactor en Component), le helper extrait
- * la 1ère ligne significative du `content` fourni (skip décoratif === / ─, comment
- * delimiters), call listEmbeds, match preview par signature normalisée. Si match
- * unique → résolution auto + update + return enrichi `{resolved_by:'signature',
- * old_id, new_id}` pour que le caller sync son fichier source. Match ambigu (≥2)
- * → fail avec `candidates[]` pour debug. Match 0 → fail explicite avec fingerprint
- * tenté. Validé empirique s549 : embed services accueil avait changé d'ID entre
- * sessions (b73fd0d9 → 998737ec après refactor en Component instance), résolution
- * manuelle via listEmbeds → désormais auto.
- *
- * MINOR v3.7.0 (s551) : setImageSettings — UI automation pour reset alt mode +
- * change loading type sur Image elements. Contournement structurel du gotcha #34
- * (canon webflow-mcp-canon.md §cluster-image-asset) : altText "Custom description"
- * sur Image existant = NON-RESET via MCP (6 routes testées s538 toutes silent-fail).
- * Sélecteurs data-automation-id stables identifiés empirique s551 :
- *   - AltTextPluginDropdown → select-option-__wf_reserved_{inherit|decorative}|custom
- *   - AltTextPluginInput (React nativeInputValueSetter pour custom text)
- *   - Type--Plugin_Enum_Type_menu → menu-option-{lazy|eager|auto}
- * Compatible s548 : aucun dispatch Redux write (only DOM events).
- * Validé empirique : 13 hero images AVG resetées (alt:inherit + loading:eager).
- *
- * PATCH v3.5.3 (s549) : 2 fixes critiques sur setComponentPropsViaUI :
- *   1. applyVisibilityProp — `btn.click()` natif IGNORÉ par les radio Webflow
- *      (validé empirique : cmd return ok mais aucune mutation store/DOM). Fix =
- *      focus + KeyboardEvent Space (le pattern qui marche empirique).
- *   2. Nouveau type `reset` — annule un override pour revenir au default template.
- *      Pattern UI : click sur le label (data-resettable=true + data-origin=local)
- *      → menu apparaît avec data-automation-id="component-property-reset" → click.
- *      Permet de re-mettre une instance à son default sans valeur arbitraire.
- *
- * MINOR v3.9.0 (s551) : dumpTree `resolveCombo` — élimine besoin de
- * `mcp__webflow__element_tool.query_elements` pour résolution des combo classes.
- * Quand `resolveCombo: true`, chaque entry inclut `classesResolved: [{id, name,
- * isCombo, parentId?, parentName?}]` à côté du tableau `classes` (plain names
- * pour back-compat). Résolu via `StyleBlockStore.parentIndex` (221 mappings AVG).
- * Validé empirique : 100% cohérence avec snapshot offline `project/webflow-state/
- * styles.json`. ~1ms overhead par node. Pair avec hook BLOCK `query_elements`
- * qui force dumpTree comme voie par défaut pour toutes inspections runtime.
- *
- * MINOR v3.6.0 (s550) : dumpTree `includeParent` default `true` (était `false`). Le
- * `parent_id` est désormais ajouté à chaque entry par défaut — résout le bug walker
- * "depth non fiable comme borne de subtree" (artefact Symbol expand). Consommateurs
- * peuvent maintenant remonter la chaîne d'ancêtres pour identifier section + variant
- * sémantique de toute Image sans dépendre du `d`. Backwards compat : ajout d'un champ
- * dans les entries non-compact. Pour retomber sur l'ancien comportement passer
- * `includeParent: false` explicitement.
- *
- * MINOR v3.5.0 (s548 · Vague 2 partielle) : setComponentPropsViaUI étendu — supporte
- * désormais `type: 'link'` (mode='page' avec pageSlug, mode='url' avec url) +
- * `type: 'visibility'` (visible boolean). Total : 3 types couverts (text + link + visibility).
- *
- * MINOR v3.4.0 (s548) : setComponentPropsViaUI — UI automation pour overrides primary
- * locale des ComponentInstance (gap MCP Data API documenté Webflow). Vague 1 = text-only
- * (Question/Réponse/CTA Text). Pattern : sélection préalable via mcp__webflow__element_tool.select_element
- * → cmd applique chaque prop via React nativeInputValueSetter + input event + blur commit.
- * Compatible s548 : aucun dispatch Redux write (only DOM events captured by Webflow React handler).
- *
- * MINOR v3.3.0 (s548) : dumpTree `expandSlotOverrides` — révèle les ComponentInstance
- * imbriquées dans des slots avec leurs prop values (Question/Réponse/CTA Text/CTA Lien
- * sur FAQ Items, etc.). Aligné stratégie s548 : lecture Redux OK, writes interdits.
- *
- * CLEANUP v3.2.0 (s547) : retiré le code mort hérité des cmds raw WebSocket retirées
- * en v2.0.0/v3.0.0 — `_internal.consumeMessageId`, `_internal.getAckDispatcher`,
- * `_internal.embedsRegistry` (+ son LRU/TTL infrastructure), helpers internes
- * `detectScript`/`readMetaScript`/`readHasCompiledDistinct`. Total : -204L (~9%).
- * Pas de changement comportemental — uniquement nettoyage interne.
- *
- * BREAKING v3.0.0 (s547) : removed `appendHtmlEmbedWS` (silent reject empirique :
- * server ACK received but embed not in AbstractNodeStore after 5000ms) et `setEmbedHasScript`
- * ([Conflict] component map empirique + redondant — Webflow auto-pose le flag w-script au Save UI
- * quand le content contient `<script>`). Toutes les cmds WebSocket directes `siteData:update`
- * migrées vers UI automation — résilient à la spec drift upstream Webflow.
- *
- * BREAKING v2.0.0 (s547) : removed `updateEmbed` (raw WebSocket dispatch) → `updateEmbedViaUI`.
+ * Version history (BREAKING / MINOR / PATCH per release) extracted to
+ * `tools/webflow-helper-CHANGELOG.md` to keep this header focused on the
+ * current command surface. See `ALLOWED_CMDS` (end of file) for the
+ * authoritative command list.
  *
  * Any other cmd called via `__webflowHelper.run('X')` returns
  * `{ ok: false, error: 'CMD_NOT_EXPOSED' }`. Everything else uses the official MCP server.
@@ -208,92 +55,10 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.25.2';
-  // [v3.20.11 (s569)] 3 fixes empiriques `addClassViaUI` (validé empirique pollution
-  // BodyM-500.grenat s569 — Webflow Style Selector autocomplete focus interne ne pointe
-  // PAS toujours sur l'exact match du dropdown, Enter sélectionnait BodyMJ-M-500 au lieu
-  // de BodyM-500) :
-  // (1) Exact match click : après typed input + wait dropdown, query [role="option"] et
-  //     click l'option dont textContent.trim() === className. Fallback Enter uniquement
-  //     si aucune option exacte (création nouvelle classe). Plus de pollution autocomplete.
-  // (2) Regex validation passe en /^[a-zA-Z0-9_-]+$/ par défaut (majuscules acceptées —
-  //     nommenclature legacy Phasya/projets multiples). Affecte addClassViaUI +
-  //     renameClassViaUI. Flag `allowLegacyUppercase` reste accepté pour rétrocompat
-  //     mais devient no-op (deprecated).
-  // (3) Speed : waits 200/300/600ms → 100/250/400ms (default waitMs). Total ~750ms vs
-  //     1130ms précédent (~33% faster) sans dégrader la fiabilité.
-  // [v3.20.10 (s569)] Fix race condition `addClassViaUI` chips DOM vs Redux : après Enter,
-  // chips_after lu trop tôt peut être vide alors que Redux state contient déjà la classe
-  // (validé empirique s569 sur uppercase legacy `BodyM-500`). Fix : fallback Redux check via
-  // `getSelectedNodeClasses()` quand chips DOM check fail. Élimine les ok:false trompeurs.
-  // [v3.20.9 (s569)] Opt-in flag `allowLegacyUppercase: true` sur addClassViaUI + renameClassViaUI.
-  // Permet d'attacher/renommer des classes legacy Phasya en uppercase (BodyM-500, BodyXL-500, etc.)
-  // existant au registry. Par défaut lowercase strict reste appliqué (convention).
-  // [v3.20.8 (s568)] 2 fixes empiriques :
-  // (1) Regex validation lowercase strict : `[a-z0-9_-]+` au lieu de `[a-zA-Z0-9_-]+` qui
-  //     laissait passer majuscules. Convention Phasya. Affecte addClassViaUI + renameClassViaUI.
-  // (2) Helper closeChipMenu() — ESC/re-click indicator/click chip ne ferment PAS le menu.
-  //     Validé empirique : click sur zone neutre du StylePanel (bas du panel) ferme menu SANS
-  //     désélectionner l'élément. Utilisé dans removeClassFromElementViaUI case disabled.
-  // [v3.20.7 (s568)] Fix critical : React `onMouseEnter` peut être listé dans Object.keys()
-  // MAIS valeur undefined sur certains chip state (combo chain) → react_props_inaccessible.
-  // Solution : helper `triggerChipHover(chip)` qui tente React puis fallback DOM hover cascade
-  // (mouseover + mouseenter + pointerover up ancestors). Validé empirique : indicator mounte
-  // bien via DOM cascade quand React undefined. Applied aux 3 cmds menu (remove/rename/duplicate).
-  // [v3.20.6 (s568)] Fix removeClassFromElementViaUI : detect disabled state du bouton "Remove class".
-  // Webflow refuse remove le PARENT d'un combo chain (chip suivi d'autre chip = combo virtuel
-  // qui aurait pas d'ancrage). Marqueurs DOM : hasAttribute('disabled') + pointer-events:none.
-  // Au lieu de silent fail, return error 'remove_option_disabled' avec hint clear pour user.
-  // [v3.20.5 (s568)] Hygiène fermeture : cleanupUnusedStylesViaUI track état initial Style Manager
-  // (wasInitiallyOpen) et close via sidebar toggle si la cmd l'a ouvert (sinon laisse comme trouvé).
-  // Helper `closeIfWeOpened()` appelé sur tous les return paths. Best practice : laisser l'état
-  // Designer comme on l'a trouvé pour ne pas perturber le workflow utilisateur.
-  // [v3.20.4 (s568)] Fix cleanupUnusedStylesViaUI : pré-check Style Manager état avant
-  // click sidebar button. Le button est un TOGGLE — sans pré-check, 2e call consécutif
-  // fermait le Style Manager au lieu de l'ouvrir. Maintenant skip le click si déjà ouvert.
-  // [v3.20.3 (s568)] 2 fixes empiriques cleanup/duplicate :
-  // (1) cleanupUnusedStylesViaUI : retiré ESC initial — empiriquement il bloquait le sidebar.click()
-  //     suivant. Remplacé par pré-check Enter si mode édit chip détecté.
-  // (2) duplicateClassViaUI : remplacé ESC par Enter post-duplicate. ESC ne sortait pas vraiment
-  //     du mode édit + bloquait les cmds suivantes. Enter commit le nom auto-généré et sort propre.
-  // [v3.20.2 (s568)] Fix cleanupUnusedStylesViaUI : remplace keydown G shortcut (Webflow exige
-  // trusted event impossible via JS) par click sur left-sidebar-styles-button (DOM cliquable
-  // équivalent). Validé empirique : aria-label "Style selectors (G)" = même action. Plus stable.
-  // [v3.20.1 (s568)] Fix duplicateClassViaUI : ajout ESC + blur cleanup après click duplicate
-  // option car Webflow laisse le chip dupliqué en mode édit (contentEditable focused pour
-  // rename immédiat workflow UX). Sans cleanup, état "ouvert" qui interfère avec actions
-  // suivantes. JSDoc enrichi avec comportement "swap pas add" et suffix " Copy" validé empirique.
-  // [v3.20.0 (s568)] Add cleanupUnusedStylesViaUI — 6e cmd Style Selector UI : bulk delete
-  // orphelines via Style Manager (raccourci G + Clean up styles button + Delete). Bypass
-  // gotchas #22 + #23 (remove_style refuse attached + parent_style_names cassé). Option
-  // dryRun pour preview liste classes avant suppression. Workflow validé empirique s568.
-  // [v3.19.2 (s568)] Doc enrichment : JSDoc renameClassViaUI documente le comportement
-  // empirique (standalone global vs combo local · flicker rebuild CSS · props préservation).
-  // No code change — versioning bump pour aligner avec canon webflow-helper-canon.md
-  // section §rename-behavior-empirique nouvellement ajoutée (4 cas validés s568).
-  // [v3.19.1 (s568)] Fix critical : `indicator.click()` natif seul N'OUVRE PAS le menu chip
-  // (validé empirique session s568 — menu_options_after_click: []). Solution : sequence complète
-  // pointerdown + mousedown + 50ms gap + pointerup + mouseup + click. Factorisée dans helper
-  // `clickMenuIndicator()`. Patché les 3 cmds menu (remove/rename/duplicate).
-  // [v3.19.0 (s568)] (1) Fix cleanupEditMode (v3.18.0 cleanupCanvasFocus déselectionnait l'élément
-  // → renameClassViaUI cassait avec chip_not_found). Maintenant ESC + blur active editable
-  // sans toucher canvas. (2) Add duplicateClassViaUI (5e cmd Style Selector UI) :
-  // workflow chip menu → Duplicate class, détecte le nouveau nom auto-généré par Webflow.
-  // [v3.18.0 (s568)] Style Selector UI actions (4 cmds) : addClassViaUI, removeLastClassViaUI,
-  // removeClassFromElementViaUI, renameClassViaUI. Bypass 5 gotchas style_tool MCP
-  // (#5 style_ids non supporté · #15 set_style enrichit silencieusement · #20 parent_style_names
-  // ne disambigue pas combos même nom · #22 remove_style refuse classe attachée · #23 idem).
-  // Pattern critique : React props onMouseEnter pour hover synthétique + element.click() natif
-  // sur menu indicator (dispatchEvent click est intercepté par overlays). dispatchEvent
-  // KeyboardEvent marche sur INPUT (input add/remove) mais PAS sur contentEditable span
-  // (rename via execCommand insertText + InputEvent fallback). Workflows complets validés
-  // empirique session s568 Sandbox AVG. Detail : webflow-helper.md §cluster-style-selector-ui.
-  // [v3.14.3 (s567)] CodeMirror v6 EditorView API integration : la lecture du content
-  // dans getEmbedContentViaUI + verify pré-save updateEmbedViaUI passe désormais par
-  // `cmContent.cmTile.view.state.doc.toString()` (API officielle CM v6) au lieu du
-  // .cm-line walk DOM (bug virtualisation : pour embed 17K chars / 472 lignes, le
-  // walk ne lit que 66 lignes vs 473 réelles). EditorView API = ground truth instant,
-  // 100% complet quelle que soit la taille, no scroll forcing needed.
+  var VERSION = '3.25.3';
+  // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
+  // CodeMirror integration, etc.) extracted to
+  // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
 
   if (!window.__webflowHelper) window.__webflowHelper = {};
   var p = window.__webflowHelper;
@@ -398,7 +163,7 @@
 
   p.run = function(command, args) {
     if (!p._localCmd[command]) {
-      return Promise.reject(new Error('[deck] Unknown command: ' + command));
+      return Promise.reject(new Error('[webflow-helper] Unknown command: ' + command));
     }
     var skipThrottle = args && args.__skip_throttle__ === true;
     var isReentrant = _inFlightDepth > 0;
@@ -413,7 +178,7 @@
     // External writes (top-level user call): cascade detection + enqueue
     var exceeded = checkCascade();
     if (exceeded) {
-      return Promise.reject(new Error('[deck] CASCADE_LIMIT_EXCEEDED — write #' + exceeded + ' enqueued within ' +
+      return Promise.reject(new Error('[webflow-helper] CASCADE_LIMIT_EXCEEDED — write #' + exceeded + ' enqueued within ' +
         CASCADE_GAP_MS + 'ms of previous write (cmd: ' + command + ').\n' +
         '  Why: zero-tolerance cascade policy. ' +
         'Sequential writes in 1 evaluate_script risk partial state + orphan styleBlocks + ' +
@@ -507,7 +272,7 @@
       return { ok: false, error: 'refreshMcpBridge requires a valid appHash string — find it in any MCP "Unable to connect" error message after "?app="' };
     }
     var url = window.location.origin + window.location.pathname + '?app=' + encodeURIComponent(appHash);
-    console.log('[deck] refreshMcpBridge — navigating to', url, '(JS context will be destroyed — re-inject __webflowHelper after Designer is ready, ~5-8s)');
+    console.log('[webflow-helper] refreshMcpBridge — navigating to', url, '(JS context will be destroyed — re-inject __webflowHelper after Designer is ready, ~5-8s)');
     window.location.href = url;
     return { ok: true, navigating: true, url: url, note: 'Page is reloading. __webflowHelper must be re-injected after reload completes.' };
   };
@@ -3259,11 +3024,11 @@
 })();
 
 // ============================================================================
-// Filter exposed cmds to whitelist (7 public commands)
+// Filter exposed cmds to whitelist — source of truth = ALLOWED_CMDS array below (25 cmds)
 // ============================================================================
 // The bundle above registers more cmds in `_localCmd` than the public surface
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
-// only the 7 whitelisted cmds are callable via `__webflowHelper.run(name)`.
+// only the whitelisted cmds (ALLOWED_CMDS) are callable via `__webflowHelper.run(name)`.
 //
 // Whitelisted cmds (9):
 // 1. switchPage - MCP de_page_tool.switch_page 70% timeout
@@ -5150,7 +4915,6 @@
     'helpEditImagesAltInComponent',
     'findNodeContext',
     'listEmbeds',
-    'getEmbedContent',
     'getEmbedContentViaUI',
     'getCurrentPageInfo',
     'dumpTree',
@@ -5176,7 +4940,10 @@
   }
 
   window.__webflowHelper.run = function(cmdName, args) {
-    if (ALLOWED_CMDS.indexOf(cmdName) === -1) {
+    // Reject if not whitelisted OR whitelisted-but-no-impl (drift) — both return
+    // a clean CMD_NOT_EXPOSED instead of leaking the inner "Unknown command" reject.
+    if (ALLOWED_CMDS.indexOf(cmdName) === -1 ||
+        typeof window.__webflowHelper._localCmd[cmdName] !== 'function') {
       var msg = 'Command "' + cmdName + '" is not exposed in __webflowHelper. ' +
                 'Whitelist: ' + ALLOWED_CMDS.join(', ') + '. ' +
                 'Use the official Webflow MCP tool instead (or window.__webflowHelper._localCmd.' + cmdName + ' for direct access - manual audit trail).';
@@ -5196,6 +4963,19 @@
       return window.__webflowHelper.run(name, args || {});
     };
   });
+
+  // Integrity check — every whitelisted cmd must have a registered _localCmd impl.
+  // Catches drift like a whitelist entry whose impl was removed (e.g. getEmbedContent
+  // in v3.24.0): without this it would pass the whitelist gate then fail with a
+  // confusing inner "Unknown command". Surfaces loudly at load instead.
+  var _missingImpls = ALLOWED_CMDS.filter(function(name) {
+    return typeof window.__webflowHelper._localCmd[name] !== 'function';
+  });
+  if (_missingImpls.length) {
+    console.error('[helper filter] INTEGRITY: ' + _missingImpls.length +
+      ' whitelisted cmd(s) without a _localCmd impl (drift): ' + _missingImpls.join(', ') +
+      ' — they return CMD_NOT_EXPOSED. Remove from ALLOWED_CMDS or restore the impl.');
+  }
 
   console.log('[helper filter] Exposed ' + ALLOWED_CMDS.length + ' cmds: ' + ALLOWED_CMDS.join(', '));
 })();
