@@ -1,4 +1,4 @@
-/* Webflow Helper v3.25.2 - 2026-05-24 */
+/* Webflow Helper v3.25.3 - 2026-05-24 */
 
 /**
  * Webflow Helper — minimal surface, exposes 25 cmds via `__webflowHelper.run()`
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.25.3';
+  var VERSION = '3.26.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -2763,7 +2763,8 @@
     return false;
   }
 
-  function findBridgeApp() {
+  // Generic: list installed apps from AppsStore (Immutable-safe).
+  function listInstalledApps() {
     var wf = getWfFromTop();
     if (!wf || !wf.stores || !wf.stores.AppsStore) return null;
     var state = wf.stores.AppsStore.state;
@@ -2773,11 +2774,44 @@
       apps = state.get ? state.get('installedApps') : state.installedApps;
       if (apps && typeof apps.toJS === 'function') apps = apps.toJS();
     } catch (e) { return null; }
-    if (!Array.isArray(apps)) return null;
+    return Array.isArray(apps) ? apps : null;
+  }
+
+  // Resolve an installed app by id (exact) or by name (case-insensitive substring,
+  // accepts a string or an array of candidate substrings).
+  function findApp(matcher) {
+    var apps = listInstalledApps();
+    if (!apps) return null;
+    if (matcher && matcher.appId) {
+      return apps.find(function(a) { return a && a.id === matcher.appId; }) || null;
+    }
+    var names = matcher && matcher.appName;
+    if (typeof names === 'string') names = [names];
+    if (!Array.isArray(names) || !names.length) return null;
+    names = names.map(function(n) { return String(n).toLowerCase(); });
     return apps.find(function(a) {
       var name = (a && (a.name || a.appName || a.displayName) || '').toLowerCase();
-      return name.indexOf('mcp bridge') !== -1 || name.indexOf('webflow mcp') !== -1;
+      return names.some(function(n) { return name.indexOf(n) !== -1; });
     }) || null;
+  }
+
+  // MCP Bridge App (unchanged contract — used by launchBridgeApp).
+  function findBridgeApp() {
+    return findApp({ appName: ['mcp bridge', 'webflow mcp'] });
+  }
+
+  // appId of the currently-mounted Designer Extension iframe (parse `{appId}.webflow-ext.com`),
+  // or null if no extension is open. Lets us tell WHICH app is active (isBridgeIframePresent
+  // only says "some extension is open").
+  function extAppId() {
+    try {
+      var iframes = document.querySelectorAll('iframe');
+      for (var i = 0; i < iframes.length; i++) {
+        var m = (iframes[i].src || '').match(/https:\/\/([a-f0-9]+)\.webflow-ext\.com/);
+        if (m) return m[1];
+      }
+    } catch (e) {}
+    return null;
   }
 
   function dispatchExtensionAction(type, payload) {
@@ -3018,6 +3052,86 @@
       position_applied: position_applied,
       duration_ms: Date.now() - startTs,
       note: 'Bridge mounted + handshake assumed complete after 500ms wait'
+    };
+  };
+
+  /**
+   * Mount ANY installed Designer Extension by name or id (generic sibling of
+   * launchBridgeApp). Since `EXTENSION_OPEN` is a no-op while another extension is
+   * already open, this CLOSES the active one first when it differs from the target.
+   * Identifies the active app by parsing the ext iframe src (`{appId}.webflow-ext.com`),
+   * so it can tell which app is mounted (not just "some extension").
+   *
+   * 🚨 Only ONE Designer Extension can be active at a time — opening the target closes
+   * whatever was open (e.g. switching to Phasya Style Bridge closes the MCP Bridge).
+   *
+   * @param {object} args
+   * @param {string} [args.appId]    Target app id (exact). Takes precedence over appName.
+   * @param {string|string[]} [args.appName] Case-insensitive substring(s) of the app name.
+   * @param {number} [args.wait_ms=4000] Max wait for the target iframe to mount.
+   * @param {boolean} [args.strict=true] Return ok:false if not converged.
+   * @returns {Promise<object>}
+   */
+  p._localCmd.launchApp = async function(args) {
+    var startTs = Date.now();
+    args = args || {};
+    var waitMs = typeof args.wait_ms === 'number' ? args.wait_ms : 4000;
+    var strict = args.strict !== false;
+    if (!args.appId && !args.appName) {
+      return { ok: false, error: errors.INVALID_ARGS, message: 'launchApp requires { appId } or { appName }' };
+    }
+
+    var app = findApp({ appId: args.appId, appName: args.appName });
+    if (!app || !app.id) {
+      return {
+        ok: false,
+        error: errors.NOT_FOUND,
+        message: 'App not found in AppsStore.installedApps',
+        target: { appId: args.appId, appName: args.appName },
+        installed: (listInstalledApps() || []).map(function(a) { return { id: a.id, name: a.name || a.appName || a.displayName }; })
+      };
+    }
+
+    var current = extAppId();
+    // Already the right app mounted → idempotent.
+    if (current === app.id) {
+      return { ok: true, already_active: true, app_id: app.id, app_name: app.name, duration_ms: Date.now() - startTs };
+    }
+
+    // A DIFFERENT extension is open → close it first (EXTENSION_OPEN is a no-op otherwise).
+    var switchedFrom = current;
+    if (current) {
+      try { dispatchExtensionAction('EXTENSION_CLOSE', {}); } catch (e) {
+        return { ok: false, error: errors.DISPATCH_REJECTED, message: 'EXTENSION_CLOSE failed: ' + e.message, mutation_attempted: true };
+      }
+      await pollUntil(function() { return extAppId() === null; }, 3000);
+    }
+
+    // Open the target.
+    try {
+      dispatchExtensionAction('EXTENSION_OPEN', { appId: app.id, dev: false, location: 'app panel' });
+    } catch (e) {
+      return { ok: false, error: errors.DISPATCH_REJECTED, message: 'EXTENSION_OPEN failed: ' + e.message, mutation_attempted: true };
+    }
+
+    var converged = await pollUntil(function() { return extAppId() === app.id; }, waitMs);
+    if (!converged && strict) {
+      return {
+        ok: false,
+        error: errors.NOT_CONVERGED,
+        message: 'Target ext iframe not mounted after ' + waitMs + 'ms',
+        app_id: app.id, app_name: app.name, switched_from: switchedFrom, mutation_attempted: true
+      };
+    }
+
+    return {
+      ok: converged,
+      app_id: app.id,
+      app_name: app.name,
+      switched_from: switchedFrom,
+      iframe_mounted_after_ms: converged ? Date.now() - startTs : null,
+      duration_ms: Date.now() - startTs,
+      note: 'Extension iframe mounted. The app JS may need ~1-2s more to boot before it answers postMessage — retry the first call.'
     };
   };
 
@@ -4907,6 +5021,7 @@
   var ALLOWED_CMDS = [
     'switchPage',
     'launchBridgeApp',
+    'launchApp',
     'appendHtmlEmbedViaUI',
     'updateEmbedViaUI',
     'renameNode',
