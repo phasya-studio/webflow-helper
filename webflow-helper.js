@@ -1,4 +1,4 @@
-/* Webflow Helper v3.25.3 - 2026-05-24 */
+/* Webflow Helper v3.26.0 - 2026-05-24 */
 
 /**
  * Webflow Helper — minimal surface, exposes 25 cmds via `__webflowHelper.run()`
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.26.0';
+  var VERSION = '3.27.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -3070,6 +3070,8 @@
    * @param {string|string[]} [args.appName] Case-insensitive substring(s) of the app name.
    * @param {number} [args.wait_ms=4000] Max wait for the target iframe to mount.
    * @param {boolean} [args.strict=true] Return ok:false if not converged.
+   * @param {string|object} [args.position] Optional repositioning after mount: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}. Best-effort, failures never block the launch result. (v3.27.0)
+   * @param {number} [args.position_margin=0] Pixels from the corner (ignored when position is {x, y}).
    * @returns {Promise<object>}
    */
   p._localCmd.launchApp = async function(args) {
@@ -3077,6 +3079,8 @@
     args = args || {};
     var waitMs = typeof args.wait_ms === 'number' ? args.wait_ms : 4000;
     var strict = args.strict !== false;
+    var requestedPosition = args.position; // undefined = no positioning
+    var positionMargin = typeof args.position_margin === 'number' ? args.position_margin : 0;
     if (!args.appId && !args.appName) {
       return { ok: false, error: errors.INVALID_ARGS, message: 'launchApp requires { appId } or { appName }' };
     }
@@ -3093,9 +3097,13 @@
     }
 
     var current = extAppId();
-    // Already the right app mounted → idempotent.
+    // Already the right app mounted → idempotent (still try to reposition if requested).
     if (current === app.id) {
-      return { ok: true, already_active: true, app_id: app.id, app_name: app.name, duration_ms: Date.now() - startTs };
+      var posReused = null;
+      if (requestedPosition) {
+        try { posReused = setBridgeWindowPosition(requestedPosition, positionMargin); } catch (e) { posReused = { ok: false, error: 'exception', message: e.message }; }
+      }
+      return { ok: true, already_active: true, app_id: app.id, app_name: app.name, position_applied: posReused, duration_ms: Date.now() - startTs };
     }
 
     // A DIFFERENT extension is open → close it first (EXTENSION_OPEN is a no-op otherwise).
@@ -3124,12 +3132,26 @@
       };
     }
 
+    // Optional repositioning after mount — uses React fiber + useState hook dispatch.
+    // Best-effort: failures here never block the launch result. The selector
+    // `iframe[src*="webflow-ext.com"]` matches the newly mounted app iframe whichever
+    // app it is (Bridge App, Phasya Style Bridge, or other custom Designer Extension).
+    var position_applied = null;
+    if (requestedPosition && converged) {
+      try {
+        position_applied = setBridgeWindowPosition(requestedPosition, positionMargin);
+      } catch (e) {
+        position_applied = { ok: false, error: 'exception', message: e.message };
+      }
+    }
+
     return {
       ok: converged,
       app_id: app.id,
       app_name: app.name,
       switched_from: switchedFrom,
       iframe_mounted_after_ms: converged ? Date.now() - startTs : null,
+      position_applied: position_applied,
       duration_ms: Date.now() - startTs,
       note: 'Extension iframe mounted. The app JS may need ~1-2s more to boot before it answers postMessage — retry the first call.'
     };
