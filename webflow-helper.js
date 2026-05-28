@@ -1,4 +1,4 @@
-/* Webflow Helper v3.26.0 - 2026-05-24 */
+/* Webflow Helper v3.27.0 - 2026-05-24 */
 
 /**
  * Webflow Helper — minimal surface, exposes 25 cmds via `__webflowHelper.run()`
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.27.0';
+  var VERSION = '3.28.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -2945,7 +2945,8 @@
     var strict = args.strict !== false;
     // Default minimized = true (the open Bridge App window covers the canvas).
     var minimized = args.minimized !== false;
-    var requestedPosition = args.position; // undefined = no positioning
+    // Default position = 'bottom-left' (v3.28.0). Pass null/false to disable.
+    var requestedPosition = args.position === undefined ? 'bottom-left' : args.position;
     var positionMargin = typeof args.position_margin === 'number' ? args.position_margin : 0;
 
     // Idempotent: if Bridge is already active, return immediately (option: minimize anyway).
@@ -3070,8 +3071,8 @@
    * @param {string|string[]} [args.appName] Case-insensitive substring(s) of the app name.
    * @param {number} [args.wait_ms=4000] Max wait for the target iframe to mount.
    * @param {boolean} [args.strict=true] Return ok:false if not converged.
-   * @param {string|object} [args.position] Optional repositioning after mount: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}. Best-effort, failures never block the launch result. (v3.27.0)
-   * @param {number} [args.position_margin=0] Pixels from the corner (ignored when position is {x, y}).
+   * @param {string|object} [args.position='bottom-left'] Repositioning after mount: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}. **Default 'bottom-left'** (v3.28.0 · l'app couvre le centre par défaut sinon). Passer `null` ou `false` pour désactiver. Best-effort, failures never block the launch result.
+   * @param {number} [args.position_margin=0] Pixels from the corner (ignored when position is {x, y}). Default 0 = collé au bord.
    * @returns {Promise<object>}
    */
   p._localCmd.launchApp = async function(args) {
@@ -3079,7 +3080,8 @@
     args = args || {};
     var waitMs = typeof args.wait_ms === 'number' ? args.wait_ms : 4000;
     var strict = args.strict !== false;
-    var requestedPosition = args.position; // undefined = no positioning
+    // Default position = 'bottom-left' (v3.28.0). Pass null/false to disable.
+    var requestedPosition = args.position === undefined ? 'bottom-left' : args.position;
     var positionMargin = typeof args.position_margin === 'number' ? args.position_margin : 0;
     if (!args.appId && !args.appName) {
       return { ok: false, error: errors.INVALID_ARGS, message: 'launchApp requires { appId } or { appName }' };
