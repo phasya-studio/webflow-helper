@@ -1,4 +1,4 @@
-/* Webflow Helper v3.27.0 - 2026-05-24 */
+/* Webflow Helper v3.28.0 - 2026-05-24 */
 
 /**
  * Webflow Helper — minimal surface, exposes 25 cmds via `__webflowHelper.run()`
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.28.0';
+  var VERSION = '3.29.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -93,7 +93,8 @@
     appendHtmlEmbedViaUI: true,
     updateEmbedViaUI: true,
     renameNode: true,
-    switchPage: true
+    switchPage: true,
+    setPageCode: true
   };
 
   var _writeQueueTail = Promise.resolve();
@@ -2932,9 +2933,10 @@
    * @param {boolean} [args.strict=true]    Return `ok:false` if not converged.
    * @param {boolean} [args.minimized=true] Auto-minimize after mount (the open Bridge
    *   window covers the canvas).
-   * @param {string|object} [args.position] Optional repositioning after mount.
+   * @param {string|object} [args.position='bottom-left'] Repositioning after mount.
    *   Accepts: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | {x, y}.
-   *   If omitted, keeps React-Draggable's default position.
+   *   **Default 'bottom-left' (v3.28.0)** — l'app couvre le centre du canvas par défaut sinon.
+   *   Passer `null` ou `false` pour désactiver (conserve la position React-Draggable courante).
    * @param {number}  [args.position_margin=0] Pixels from corner when position is a string.
    * @returns {Promise<object>}
    */
@@ -5036,6 +5038,224 @@
   console.log('[NavSelect] 3 commands registered: selectNode, openComponentView, closeComponentView (v3.25.0 s573)');
 })();
 
+/**
+ * PageCode — read/write per-page Schema markup & Custom code via Page Settings UI automation.
+ *
+ * Couvre les 3 champs CodeMirror du panneau Page Settings :
+ *   - 'schema' → "Schema markup → JSON-LD schema" (champ dédié JSON-LD · défaut)
+ *   - 'head'   → "Custom code → Inside <head> tag"
+ *   - 'body'   → "Custom code → Before </body> tag"
+ *
+ * MCP gap : la Designer API n'expose PAS le schema/custom code de page (settings hors
+ * canvas). REST `/scripts` retiré (404). Seule voie d'automatisation = UI Page Settings.
+ *
+ * Workflow (reverse-engineered s590 via event recorder sur AVG) :
+ *   1. Ouvrir Page Settings : click [top-bar-page-name] → click [page-selected-settings-button]
+ *   2. Classer les .cm-editor : head/body par label adjacent ; schema = le restant
+ *   3. EditorView CM6 via cmContent.cmTile.view (fallback scan props)
+ *      Lire   : view.state.doc.toString() (bypass virtualisation DOM)
+ *      Écrire : view.dispatch({changes}) — validé empirique s590 sur Page Settings
+ *               (déclenche le onChange Webflow → bouton Save activé → persistance OK)
+ *   4. Save  : click [save-page-button] (save+close) · Close : [close-page-settings-button]
+ *
+ * Prérequis : être sur la BONNE page (le code est scopé par page → appeler switchPage
+ * AVANT si besoin). Pas de switchPage intégré (single responsibility · cooldown 2000ms).
+ *
+ * @see docs/lessons/webflow-helper.md §pagecode-workflow
+ */
+(function() {
+  'use strict';
+  if (!window.__webflowHelper) return;
+  var p = window.__webflowHelper;
+  if (!p._localCmd) p._localCmd = {};
+
+  function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  var FIELD_RX = {
+    head: /inside\s*<?\s*head/i,
+    body: /before\s*<?\s*\/?\s*body/i
+  };
+  var VALID_FIELDS = ['schema', 'head', 'body'];
+
+  // Ouvre le panneau Page Settings (idempotent : skip si déjà ouvert).
+  async function openPageSettings(D) {
+    if (document.querySelector('[data-automation-id="page-settings-panel"]')) {
+      return { ok: true, already: true };
+    }
+    var nameBtn = document.querySelector('[data-automation-id="top-bar-page-name"]');
+    if (!nameBtn) return { ok: false, error: 'top-bar-page-name introuvable (pas sur le canvas Designer ?)' };
+    nameBtn.click();
+    await wait(D.afterOpenMenu);
+    var setBtn = document.querySelector('[data-automation-id="page-selected-settings-button"]');
+    if (!setBtn) return { ok: false, error: 'page-selected-settings-button introuvable apres ouverture du menu page' };
+    setBtn.click();
+    await wait(D.afterOpenSettings);
+    if (!document.querySelector('[data-automation-id="page-settings-panel"]')) {
+      return { ok: false, error: 'page-settings-panel non monte apres ouverture' };
+    }
+    return { ok: true, already: false };
+  }
+
+  async function closePageSettings(D) {
+    var btn = document.querySelector('[data-automation-id="close-page-settings-button"]');
+    if (btn) { btn.click(); await wait(D.afterClose); return true; }
+    return false;
+  }
+
+  // EditorView CM6 d'un .cm-editor : API officielle cmTile.view, fallback scan props.
+  function getView(cmEditor) {
+    if (!cmEditor) return null;
+    var cmContent = cmEditor.querySelector('.cm-content');
+    if (cmContent && cmContent.cmTile && cmContent.cmTile.view && cmContent.cmTile.view.state) {
+      return cmContent.cmTile.view;
+    }
+    var cands = [cmEditor, cmContent, cmEditor.querySelector('.cm-scroller')];
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i];
+      if (!el) continue;
+      var keys = Object.keys(el);
+      for (var j = 0; j < keys.length; j++) {
+        try {
+          var v = el[keys[j]];
+          if (v && v.state && v.state.doc) return v;
+          if (v && v.view && v.view.state && v.view.state.doc) return v.view;
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
+  // Classe les .cm-editor du panneau en {schema, head, body}.
+  // head/body : label adjacent au-dessus ; schema : le 1er éditeur restant (section
+  // Schema markup toujours au-dessus de Custom code dans Page Settings).
+  function classifyEditors() {
+    // [class*="label" i] : flag i OBLIGATOIRE — les labels Webflow sont des
+    // <div class="bem-Label bem-Field_Label"> (CamelCase "Label"). Sans i → 0 match (validé s590).
+    var labels = Array.prototype.slice.call(document.querySelectorAll('label, [class*="label" i]'))
+      .map(function(el) { return { txt: (el.textContent || '').trim(), top: el.getBoundingClientRect().top }; })
+      .filter(function(l) { return l.txt && l.txt.length < 40 && (FIELD_RX.head.test(l.txt) || FIELD_RX.body.test(l.txt)); });
+    var editors = Array.prototype.slice.call(document.querySelectorAll('.cm-editor'));
+    var map = { schema: null, head: null, body: null };
+    editors.forEach(function(ed) {
+      var top = ed.getBoundingClientRect().top;
+      var above = labels.filter(function(l) { return l.top < top; }).sort(function(a, b) { return b.top - a.top; })[0];
+      if (above && FIELD_RX.head.test(above.txt) && !map.head) map.head = ed;
+      else if (above && FIELD_RX.body.test(above.txt) && !map.body) map.body = ed;
+    });
+    editors.forEach(function(ed) {
+      if (ed !== map.head && ed !== map.body && !map.schema) map.schema = ed;
+    });
+    return { map: map, editorCount: editors.length };
+  }
+
+  /**
+   * Lit un champ de code de la page courante.
+   * @param {object} args
+   * @param {string}  [args.field='schema']   'schema' | 'head' | 'body'
+   * @param {boolean} [args.keepOpen=false]   garder Page Settings ouvert après lecture
+   * @param {object}  [args.waitMs]
+   * @returns {Promise<object>} { ok, field, content, length, editorCount, durationMs, error? }
+   */
+  p._localCmd.getPageCode = async function(args) {
+    args = args || {};
+    var field = args.field || 'schema';
+    if (VALID_FIELDS.indexOf(field) === -1) return { ok: false, error: 'field invalide: ' + field + ' (schema|head|body)' };
+    var wm = args.waitMs || {};
+    var D = { afterOpenMenu: wm.afterOpenMenu || 700, afterOpenSettings: wm.afterOpenSettings || 1600, afterClose: wm.afterClose || 300 };
+    var start = Date.now();
+
+    var opened = await openPageSettings(D);
+    if (!opened.ok) return { ok: false, error: opened.error, durationMs: Date.now() - start };
+
+    var c = classifyEditors();
+    var editor = c.map[field];
+    if (!editor) {
+      if (!args.keepOpen) await closePageSettings(D);
+      return { ok: false, error: 'champ "' + field + '" introuvable (section repliée ?)', editorCount: c.editorCount, durationMs: Date.now() - start };
+    }
+    var view = getView(editor);
+    if (!view) {
+      if (!args.keepOpen) await closePageSettings(D);
+      return { ok: false, error: 'EditorView inaccessible pour "' + field + '"', durationMs: Date.now() - start };
+    }
+
+    var content = view.state.doc.toString();
+    if (!args.keepOpen) await closePageSettings(D);
+    return { ok: true, field: field, content: content, length: content.length, editorCount: c.editorCount, durationMs: Date.now() - start };
+  };
+
+  /**
+   * Écrit un champ de code de la page courante (remplace tout le contenu) puis Save.
+   * @param {object}  args
+   * @param {string}  [args.field='schema']   'schema' | 'head' | 'body'
+   * @param {string}  args.content            contenu à écrire (remplace l'existant)
+   * @param {boolean} [args.save=true]        true → Save (save+close) · false → laisse ouvert NON sauvegardé (inspection)
+   * @param {object}  [args.waitMs]
+   * @returns {Promise<object>} { ok, success, field, expectedLength, cmVerifiedLength, delta, saved, panelClosed, durationMs, error? }
+   */
+  p._localCmd.setPageCode = async function(args) {
+    args = args || {};
+    var field = args.field || 'schema';
+    if (VALID_FIELDS.indexOf(field) === -1) return { ok: false, error: 'field invalide: ' + field + ' (schema|head|body)' };
+    if (typeof args.content !== 'string') return { ok: false, error: 'content (string) requis' };
+    var content = args.content;
+    var save = args.save !== false; // défaut true
+    var wm = args.waitMs || {};
+    var D = {
+      afterOpenMenu: wm.afterOpenMenu || 700, afterOpenSettings: wm.afterOpenSettings || 1600,
+      afterWrite: wm.afterWrite || 400, afterSave: wm.afterSave || 2500, afterClose: wm.afterClose || 300
+    };
+    var start = Date.now();
+
+    var opened = await openPageSettings(D);
+    if (!opened.ok) return { ok: false, error: opened.error, durationMs: Date.now() - start };
+
+    var c = classifyEditors();
+    var editor = c.map[field];
+    if (!editor) return { ok: false, error: 'champ "' + field + '" introuvable (section repliée ?)', editorCount: c.editorCount, durationMs: Date.now() - start };
+    var view = getView(editor);
+    if (!view) return { ok: false, error: 'EditorView inaccessible pour "' + field + '"', durationMs: Date.now() - start };
+
+    // Écriture via EditorView.dispatch (CM6) — déclenche le onChange Webflow (Save activé).
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content } });
+    await wait(D.afterWrite);
+
+    // Vérif pre-save (ground truth CM6 · tolérance ±2 pour trailing newline).
+    var after = view.state.doc.toString();
+    var verifyOk = (after.length === content.length) || (Math.abs(after.length - content.length) <= 2);
+    if (!verifyOk) {
+      return {
+        ok: false, success: false, field: field, expectedLength: content.length, cmVerifiedLength: after.length,
+        delta: content.length - after.length, saved: false,
+        error: 'verification echec : attendu ' + content.length + ' chars, obtenu ' + after.length,
+        durationMs: Date.now() - start
+      };
+    }
+
+    if (!save) {
+      return {
+        ok: true, success: true, field: field, expectedLength: content.length, cmVerifiedLength: after.length,
+        delta: content.length - after.length, saved: false,
+        note: 'panneau laissé ouvert, NON sauvegardé (save:false) — inspecter puis Save manuel ou re-appeler avec save:true',
+        durationMs: Date.now() - start
+      };
+    }
+
+    var saveBtn = document.querySelector('[data-automation-id="save-page-button"]');
+    if (!saveBtn) return { ok: false, error: 'save-page-button introuvable', cmVerifiedLength: after.length, durationMs: Date.now() - start };
+    saveBtn.click();
+    await wait(D.afterSave);
+    var panelClosed = !document.querySelector('[data-automation-id="page-settings-panel"]');
+
+    return {
+      ok: true, success: true, field: field, expectedLength: content.length, cmVerifiedLength: after.length,
+      delta: content.length - after.length, saved: true, panelClosed: panelClosed, durationMs: Date.now() - start
+    };
+  };
+
+  console.log('[PageCode] 2 commands registered: getPageCode, setPageCode (v3.29.0 s590)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -5068,7 +5288,9 @@
     'dumpComboIndex',
     'selectNode',
     'openComponentView',
-    'closeComponentView'
+    'closeComponentView',
+    'getPageCode',
+    'setPageCode'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
