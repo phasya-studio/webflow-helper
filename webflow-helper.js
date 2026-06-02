@@ -1,7 +1,7 @@
-/* Webflow Helper v3.28.0 - 2026-05-24 */
+/* Webflow Helper v3.30.0 - 2026-06-02 */
 
 /**
- * Webflow Helper — minimal surface, exposes 25 cmds via `__webflowHelper.run()`
+ * Webflow Helper — minimal surface, exposes 28 cmds via `__webflowHelper.run()`
  * (source of truth = the ALLOWED_CMDS array at the end of this file):
  *
  * 1. switchPage — workaround MCP de_page_tool.switch_page (~70% timeout empirically)
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.29.0';
+  var VERSION = '3.30.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -1342,13 +1342,20 @@
   }
 
   function findPageRecord(stores, pageId) {
+    // v3.30.0 (s591) : cherche dans staticPages + dynamicPages (Collection Pages
+    // detail_*) + componentPages. Le thunk creators.switchPage accepte un record
+    // dynamique (validé empirique s591 sur template detail_blog).
     var ps = stores && stores.PageStore && stores.PageStore.state;
-    if (!ps) return null;
-    var sps = ps.get && ps.get('staticPages');
-    if (!sps || !sps.find) return null;
-    return sps.find(function(p) {
-      return p && p.get && p.get('id') === pageId;
-    }) || null;
+    if (!ps || !ps.get) return null;
+    var sources = ['staticPages', 'dynamicPages', 'componentPages'];
+    for (var i = 0; i < sources.length; i++) {
+      var coll = ps.get(sources[i]);
+      if (coll && coll.find) {
+        var rec = coll.find(function(p) { return p && p.get && p.get('id') === pageId; });
+        if (rec) return rec;
+      }
+    }
+    return null;
   }
 
   function getCurrentPageId(stores) {
@@ -1436,15 +1443,17 @@
     var pageRecord = findPageRecord(stores, pageId);
     if (!pageRecord) {
       var available = [];
-      var sps = stores.PageStore.state.get('staticPages');
-      if (sps) sps.forEach(function(p) {
-        if (p && p.get) available.push({ id: p.get('id'), name: p.get('name') });
+      ['staticPages', 'dynamicPages'].forEach(function(src) {
+        var coll = stores.PageStore.state.get(src);
+        if (coll) coll.forEach(function(p) {
+          if (p && p.get) available.push({ id: p.get('id'), name: p.get('name'), kind: src === 'dynamicPages' ? 'collection' : 'static' });
+        });
       });
       return {
         ok: false,
         error: errors.PAGE_NOT_FOUND,
-        message: 'page_id "' + pageId + '" not found in PageStore.staticPages',
-        available_pages: available.slice(0, 20),
+        message: 'page_id "' + pageId + '" not found in PageStore.staticPages|dynamicPages|componentPages',
+        available_pages: available.slice(0, 30),
         mutation_attempted: false
       };
     }
@@ -3164,7 +3173,7 @@
 })();
 
 // ============================================================================
-// Filter exposed cmds to whitelist — source of truth = ALLOWED_CMDS array below (25 cmds)
+// Filter exposed cmds to whitelist — source of truth = ALLOWED_CMDS array below (28 cmds)
 // ============================================================================
 // The bundle above registers more cmds in `_localCmd` than the public surface
 // (some are internal helpers used between modules above). This filter wraps `run()` so that
@@ -5049,17 +5058,22 @@
  * MCP gap : la Designer API n'expose PAS le schema/custom code de page (settings hors
  * canvas). REST `/scripts` retiré (404). Seule voie d'automatisation = UI Page Settings.
  *
- * Workflow (reverse-engineered s590 via event recorder sur AVG) :
- *   1. Ouvrir Page Settings : click [top-bar-page-name] → click [page-selected-settings-button]
- *   2. Classer les .cm-editor : head/body par label adjacent ; schema = le restant
- *   3. EditorView CM6 via cmContent.cmTile.view (fallback scan props)
+ * Workflow (reverse-engineered s590 via event recorder sur AVG · MAJ s591 Collection Pages) :
+ *   1. Ouvrir Page Settings : click [top-bar-page-name] OU [page-dynamic-item-select-trigger]
+ *      (Collection Pages) → click [page-selected-settings-button]
+ *   2. Scroller le label "JSON-LD schema" (lazy-mount du CM sur pages longues · s591)
+ *   3. Classer les .cm-editor : head/body par label adjacent ; schema = le restant
+ *   4. EditorView CM6 via cmContent.cmTile.view (fallback scan props)
  *      Lire   : view.state.doc.toString() (bypass virtualisation DOM)
  *      Écrire : view.dispatch({changes}) — validé empirique s590 sur Page Settings
  *               (déclenche le onChange Webflow → bouton Save activé → persistance OK)
- *   4. Save  : click [save-page-button] (save+close) · Close : [close-page-settings-button]
+ *               Sur champ CMS-bindé (templates detail_*) : passer le format token
+ *               `{{wf {...}\} }}` byte-exact → re-tokenise en chips (validé s591).
+ *   5. Save  : click [save-page-button] (save+close) · Close : [close-page-settings-button]
  *
  * Prérequis : être sur la BONNE page (le code est scopé par page → appeler switchPage
- * AVANT si besoin). Pas de switchPage intégré (single responsibility · cooldown 2000ms).
+ * AVANT si besoin · switchPage v3.30.0 supporte les Collection Pages). Pas de switchPage
+ * intégré (single responsibility · cooldown 2000ms).
  *
  * @see docs/lessons/webflow-helper.md §pagecode-workflow
  */
@@ -5078,15 +5092,20 @@
   var VALID_FIELDS = ['schema', 'head', 'body'];
 
   // Ouvre le panneau Page Settings (idempotent : skip si déjà ouvert).
+  // v3.30.0 (s591) : supporte les Collection Pages (templates detail_*) dont le bouton
+  // du nom de page = [page-dynamic-item-select-trigger] (≠ [top-bar-page-name] des pages
+  // statiques). Le trigger ouvre un popover contenant le MÊME [page-selected-settings-button].
   async function openPageSettings(D) {
     if (document.querySelector('[data-automation-id="page-settings-panel"]')) {
       return { ok: true, already: true };
     }
-    var nameBtn = document.querySelector('[data-automation-id="top-bar-page-name"]');
-    if (!nameBtn) return { ok: false, error: 'top-bar-page-name introuvable (pas sur le canvas Designer ?)' };
-    nameBtn.click();
-    await wait(D.afterOpenMenu);
+    var nameBtn = document.querySelector('[data-automation-id="top-bar-page-name"]')
+               || document.querySelector('[data-automation-id="page-dynamic-item-select-trigger"]');
+    if (!nameBtn) return { ok: false, error: 'top-bar-page-name / page-dynamic-item-select-trigger introuvable (pas sur le canvas Designer ?)' };
     var setBtn = document.querySelector('[data-automation-id="page-selected-settings-button"]');
+    if (!setBtn) { nameBtn.click(); await wait(D.afterOpenMenu); setBtn = document.querySelector('[data-automation-id="page-selected-settings-button"]'); }
+    // Collection pages : le popover peut se toggle (1er click) — retry une fois.
+    if (!setBtn) { nameBtn.click(); await wait(D.afterOpenMenu); setBtn = document.querySelector('[data-automation-id="page-selected-settings-button"]'); }
     if (!setBtn) return { ok: false, error: 'page-selected-settings-button introuvable apres ouverture du menu page' };
     setBtn.click();
     await wait(D.afterOpenSettings);
@@ -5094,6 +5113,21 @@
       return { ok: false, error: 'page-settings-panel non monte apres ouverture' };
     }
     return { ok: true, already: false };
+  }
+
+  // v3.30.0 (s591) : le CodeMirror du champ schema est lazy-mounté (rendu au scroll)
+  // sur les pages à long Page Settings (faq, Collection Pages). Scroller le label
+  // "JSON-LD schema" dans la vue force son montage AVANT classifyEditors.
+  async function ensureSchemaMounted(D) {
+    var els = document.querySelectorAll('span, div');
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].children.length === 0 && (els[i].textContent || '').trim() === 'JSON-LD schema') {
+        els[i].scrollIntoView({ block: 'center' });
+        await wait(D.afterScroll || 800);
+        return true;
+      }
+    }
+    return false;
   }
 
   async function closePageSettings(D) {
@@ -5161,12 +5195,13 @@
     var field = args.field || 'schema';
     if (VALID_FIELDS.indexOf(field) === -1) return { ok: false, error: 'field invalide: ' + field + ' (schema|head|body)' };
     var wm = args.waitMs || {};
-    var D = { afterOpenMenu: wm.afterOpenMenu || 700, afterOpenSettings: wm.afterOpenSettings || 1600, afterClose: wm.afterClose || 300 };
+    var D = { afterOpenMenu: wm.afterOpenMenu || 700, afterOpenSettings: wm.afterOpenSettings || 1600, afterClose: wm.afterClose || 300, afterScroll: wm.afterScroll || 800 };
     var start = Date.now();
 
     var opened = await openPageSettings(D);
     if (!opened.ok) return { ok: false, error: opened.error, durationMs: Date.now() - start };
 
+    if (field === 'schema') await ensureSchemaMounted(D);
     var c = classifyEditors();
     var editor = c.map[field];
     if (!editor) {
@@ -5203,13 +5238,15 @@
     var wm = args.waitMs || {};
     var D = {
       afterOpenMenu: wm.afterOpenMenu || 700, afterOpenSettings: wm.afterOpenSettings || 1600,
-      afterWrite: wm.afterWrite || 400, afterSave: wm.afterSave || 2500, afterClose: wm.afterClose || 300
+      afterWrite: wm.afterWrite || 400, afterSave: wm.afterSave || 2500, afterClose: wm.afterClose || 300,
+      afterScroll: wm.afterScroll || 800
     };
     var start = Date.now();
 
     var opened = await openPageSettings(D);
     if (!opened.ok) return { ok: false, error: opened.error, durationMs: Date.now() - start };
 
+    if (field === 'schema') await ensureSchemaMounted(D);
     var c = classifyEditors();
     var editor = c.map[field];
     if (!editor) return { ok: false, error: 'champ "' + field + '" introuvable (section repliée ?)', editorCount: c.editorCount, durationMs: Date.now() - start };
@@ -5253,7 +5290,7 @@
     };
   };
 
-  console.log('[PageCode] 2 commands registered: getPageCode, setPageCode (v3.29.0 s590)');
+  console.log('[PageCode] 2 commands registered: getPageCode, setPageCode (v3.30.0 s591 · Collection Pages support)');
 })();
 
 (function filterExposedCmds() {
