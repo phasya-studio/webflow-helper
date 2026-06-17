@@ -1,4 +1,4 @@
-/* Webflow Helper v3.30.0 - 2026-06-02 */
+/* Webflow Helper v3.31.0 - 2026-06-02 */
 
 /**
  * Webflow Helper — minimal surface, exposes 28 cmds via `__webflowHelper.run()`
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.31.0';
+  var VERSION = '3.32.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -571,31 +571,42 @@
    * (slower but ground-truth) to confirm the value reached server-side.
    */
   p._localCmd.listEmbeds = function() {
-    var root = getRoot();
-    if (!root) return { ok: false, error: 'No root node' };
-    var allBlocks = getStyleBlocksJS();
+    // DOM-based (s623 — Designer "next" removed the Redux AbstractNodeStore that
+    // the old node-tree walk relied on). HtmlEmbeds render as `.w-embed` divs in
+    // the canvas; enumerate them from the DOM. Covers component-internal embeds
+    // too (data-wf-id array). ⚠️ `length`/`preview` reflect the RENDERED innerHTML,
+    // NOT the source code — enough to identify an embed; read true source via
+    // getEmbedContentViaUI.
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    var doc = null;
+    try { doc = canvas && canvas.contentDocument; } catch (e) { doc = null; }
+    if (!doc || !doc.body) return { ok: false, error: 'No canvas DOM — Designer not loaded?' };
+
+    var els = doc.querySelectorAll('.w-embed');
     var embeds = [];
-
-    helpers.walkTree(root, function(node) {
-      if (node.get('type') !== 'HtmlEmbed') return;
-      var data = node.get('data');
-      if (!data) return;
-      var value = data.get('value') || '';
-      var sbIds = data.get('styleBlockIds');
-      var arr = sbIds ? toJS(sbIds) : [];
-      var classes = arr.map(function(sid) {
-        var b = allBlocks[sid];
-        return b ? b.name : sid;
-      });
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var wid = el.getAttribute('data-w-id');
+      var inComponent = false;
+      try {
+        var arr = JSON.parse(el.getAttribute('data-wf-id') || '[]');
+        if (Array.isArray(arr) && arr.length) {
+          if (!wid) wid = arr[0];        // component-internal embed: data-w-id absent
+          inComponent = arr.length > 1;
+        }
+      } catch (e) {}
+      // design classes only (drop Webflow built-ins like w-embed/w-script)
+      var classes = (el.className || '').toString().split(/\s+/).filter(function(c) { return c && c.indexOf('w-') !== 0; });
+      var inner = el.innerHTML || '';
       embeds.push({
-        id: node.get('id'),
+        id: wid,
         classes: classes,
-        length: value.length,
-        preview: value.substring(0, 120)
+        length: inner.length,
+        preview: inner.replace(/\s+/g, ' ').trim().substring(0, 120),
+        inComponent: inComponent
       });
-    }, 30, 0);
-
-    return { ok: true, count: embeds.length, embeds: embeds };
+    }
+    return { ok: true, count: embeds.length, embeds: embeds, source: 'dom_canvas' };
   };
 
   /**
@@ -1745,7 +1756,6 @@
   p._localCmd.getCurrentPageInfo = function() {
     return safeCall(function() {
       var page = p._localCmd.getCurrentPage();
-      var body = getBody();
       var counts = {
         total_elements: 0,
         sections: 0,
@@ -1755,19 +1765,37 @@
         headings: 0,
         links: 0
       };
-      var bodyId = body ? body.get('id') : null;
-      if (body) {
-        helpers.walkTree(body, function(node) {
-          counts.total_elements++;
-          var t = node.get && node.get('type');
-          if (t === 'Section') counts.sections++;
-          else if (t === 'HtmlEmbed') counts.embeds++;
-          else if (t === 'Symbol') counts.symbols++;
-          else if (t === 'Image') counts.images++;
-          else if (t === 'Heading') counts.headings++;
-          else if (t === 'Link' || t === 'TextLink' || t === 'LinkBlock') counts.links++;
-        });
-      }
+      var bodyId = null;
+      // DOM-based counts (s623 — Designer "next" removed AbstractNodeStore; the
+      // old getBody()/walkTree path returned null). Counts are informational.
+      try {
+        var cvs = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+        var cdoc = cvs && cvs.contentDocument;
+        if (cdoc && cdoc.body) {
+          bodyId = cdoc.body.getAttribute('data-w-id') || null;
+          counts.total_elements = cdoc.querySelectorAll('[data-w-id]').length;
+          counts.sections = cdoc.querySelectorAll('section').length;
+          counts.embeds = cdoc.querySelectorAll('.w-embed').length;
+          counts.images = cdoc.querySelectorAll('img').length;
+          counts.headings = cdoc.querySelectorAll('h1,h2,h3,h4,h5,h6').length;
+          counts.links = cdoc.querySelectorAll('a').length;
+          // symbols ≈ component instances: count "instance roots" = elements whose
+          // data-wf-id path is DEEPER than the parent's (entering a component
+          // context). data-wf-id is an element-id PATH (not [el, instanceId]), so
+          // distinct-id counting over-counts wildly; the depth transition is the
+          // reliable proxy for "how many component instances on the page".
+          var wfDepth = function(el) {
+            if (!el) return 0;
+            try { var a = JSON.parse(el.getAttribute('data-wf-id') || '[]'); return Array.isArray(a) ? a.length : 0; } catch (e) { return 0; }
+          };
+          var symbolRoots = 0;
+          var wf = cdoc.querySelectorAll('[data-wf-id]');
+          for (var wi = 0; wi < wf.length; wi++) {
+            if (wfDepth(wf[wi]) > wfDepth(wf[wi].parentElement)) symbolRoots++;
+          }
+          counts.symbols = symbolRoots;
+        }
+      } catch (e) { /* DOM unavailable — counts stay 0 */ }
       var source = readPageSource(page);
       var warning = computePageWarning(source, page);
       return { page: page, bodyId: bodyId, counts: counts, source: source, warning: warning };
