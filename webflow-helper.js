@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.30.0';
+  var VERSION = '3.31.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -321,8 +321,25 @@
     THUNK_REJECTED: 'thunk_rejected'
   };
 
+  // getCanvasWf — resolve the Designer CANVAS Webflow API (Redux store + styles).
+  // Designer "next" (Webflow upstream refactor, observed s623) moved the canvas
+  // Redux store into the #site-iframe-next iframe; older Designer builds exposed
+  // it on the top window. Prefer the iframe, fall back to the top window so this
+  // works on BOTH architectures. NOTE: the Bridge App itself still lives on the
+  // top window — use getWfFromTop()/getTopWindow() (LaunchBridge module) for
+  // app/launch concerns, not this.
+  function getCanvasWf() {
+    try {
+      var ifr = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+      var w = ifr && ifr.contentWindow;
+      if (w && w._webflow && typeof w._webflow.getState === 'function') return w._webflow;
+    } catch (e) {}
+    return (window._webflow && typeof window._webflow.getState === 'function') ? window._webflow : null;
+  }
+
   function getReduxState() {
-    return window._webflow && window._webflow.getState && window._webflow.getState();
+    var wf = getCanvasWf();
+    return wf && wf.getState ? wf.getState() : null;
   }
 
   function getStores() {
@@ -468,6 +485,7 @@
 
   p._internal.helpers = {
     // Redux access
+    getCanvasWf: getCanvasWf,
     getReduxState: getReduxState,
     getStores: getStores,
     // Immutable conversion
@@ -2142,6 +2160,24 @@
     };
   }
 
+  // dumpTree — DOM-canvas tree dump (rewritten s623 for the Designer "next" arch).
+  //
+  // Webflow's "next" Designer moved the node document OUT of the Redux
+  // AbstractNodeStore (now removed) into an internal sync/CRDT + Apollo + React
+  // structure that is not cleanly readable from the page. The rendered canvas DOM
+  // (#site-iframe-next.contentDocument) remains the stable contract: every design
+  // node carries data-w-id + resolved class names + tag + text + DOM hierarchy =
+  // exactly what the Navigator shows. This walk reproduces the previous Redux
+  // output shape (depth/type/tag/id/classes/text/attr/parent_id/breadcrumb +
+  // direct_children/count) from the DOM. Works on BOTH old and new Designer
+  // (the canvas DOM exists in both). Class names come pre-resolved (no
+  // StyleBlockStore lookup needed) and component instances render inline.
+  //
+  // Honored params: maxDepth, filterType, filterClass, filterText, includeEmpty,
+  // compact, includeText, includeAttr, includeXattr, rootId, includeParent,
+  // includeBreadcrumb, resolveCombo (best-effort via the surviving StyleBlockStore).
+  // No-op params (kept for back-compat): expandComponents, expandSlotOverrides,
+  // hideTemplateRoots — the DOM already contains expanded component internals.
   p._localCmd.dumpTree = function(args) {
     args = args || {};
     var maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 50;
@@ -2150,294 +2186,247 @@
     var filterTextLower = args.filterText ? String(args.filterText).toLowerCase() : null;
     var includeEmpty = args.includeEmpty !== false;
     var compact = args.compact === true;
-    var expandComponents = args.expandComponents === true;
-    var hideTemplateRoots = args.hideTemplateRoots === true;
-    var expandSlotOverrides = args.expandSlotOverrides === true; // v3.3.0
-    var rootIdScope = args.rootId || null;          // v1.6.0
-    var includeParent = args.includeParent !== false; // v3.6.0 — default true (était === true en v1.6.0)
-    var resolveCombo = args.resolveCombo === true;   // v3.9.0 — enrich classesResolved
-    var includeBreadcrumb = args.includeBreadcrumb === true; // v3.16.0 — chaîne ancêtres
-    var entryOpts = {
-      compact: compact,
-      // v3.16.0 fix : forcer includeText/Attr si un filter sur ce champ est actif,
-      // sinon le filter rejette tout en compact (text=null car non-extracted).
-      includeText: (args.includeText !== false && !compact) || !!filterTextLower,
-      includeAttr: args.includeAttr !== false && !compact,
-      includeXattr: args.includeXattr !== false && !compact,
-      resolveCombo: resolveCombo
-    };
+    var rootIdScope = args.rootId || null;
+    var includeParent = args.includeParent !== false;
+    var includeBreadcrumb = args.includeBreadcrumb === true;
+    var resolveCombo = args.resolveCombo === true;
+    var includeText = (args.includeText !== false && !compact) || !!filterTextLower;
+    var includeAttr = args.includeAttr !== false && !compact;
+    var includeXattr = args.includeXattr !== false && !compact;
 
-    // v1.6.0 — root scoping
-    var root;
+    // Canvas DOM = source of truth (see header).
+    var canvas = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
+    var doc = null;
+    try { doc = canvas && canvas.contentDocument; } catch (e) { doc = null; }
+    if (!doc || !doc.body) {
+      return { ok: false, error: 'No canvas DOM — Designer not loaded? (#site-iframe-next contentDocument unavailable)' };
+    }
+
+    // Root element: rootId-scoped node, else the canvas <body>.
+    var rootEl;
     if (rootIdScope) {
-      root = helpers.findNodeById(rootIdScope);
-      if (!root) return { ok: false, error: 'Node not found by id: ' + rootIdScope };
+      rootEl = doc.querySelector('[data-w-id="' + rootIdScope + '"]');
+      if (!rootEl) return { ok: false, error: 'Node not found by id: ' + rootIdScope };
     } else {
-      root = helpers.getRoot();
-      if (!root) return { ok: false, error: 'No root node — Designer not loaded?' };
+      rootEl = doc.body;
     }
 
-    // Resolve styleBlocks once for the entire walk.
-    var sbs = null;
-    var parentIndex = null; // v3.9.0
-    try {
-      var state = helpers.getReduxState();
-      var sbStore = state && state.StyleBlockStore;
-      if (sbStore && sbStore.get) {
-        var blocks = sbStore.get('styleBlocks');
-        sbs = blocks && blocks.toJS ? blocks.toJS() : blocks;
-        // v3.9.0 — parentIndex pour résolution combo (Map<comboId, parentId>)
-        if (resolveCombo) {
-          var pi = sbStore.get('parentIndex');
-          parentIndex = pi && pi.toJS ? pi.toJS() : pi;
-        }
-      }
-    } catch (e) { sbs = null; parentIndex = null; }
-
-    // Pre-walk: index template roots (data.sym.root === true) by node id.
-    // Templates live at depth 1 of root in Webflow's flat AbstractNodeStore.
-    // Lookup is by data.sym.inst from Symbol instances.
-    var templatesById = {};
-    if (expandComponents) {
+    // Optional combo resolution: className -> parentClassName via the surviving
+    // StyleBlockStore (getReduxState is canvas-iframe-aware since s623).
+    var nameParent = null;
+    if (resolveCombo) {
       try {
-        helpers.walkTree(root, function(n) {
-          var d = n.get && n.get('data');
-          var s = d && d.get && d.get('sym');
-          if (s && s.get && s.get('root') === true) {
-            templatesById[n.get('id')] = n;
-          }
-        }, { maxDepth: 5 });
-      } catch (e) { /* fail silently — feature degrades to non-expand */ }
-    }
-
-    var out = [];
-    var totalWalked = 0;
-    var expandedCount = 0;
-    var slotOverridesCount = 0; // v3.3.0
-    var parentStack = []; // v1.6.0 — [{ depth, id, type?, classFirst? }] for includeParent + includeBreadcrumb v3.16.0
-
-    function applyFiltersAndPush(entry, type, classes, text) {
-      if (filterType && type !== filterType) return;
-      if (filterClassLower) {
-        var match = classes.some(function(c) {
-          return typeof c === 'string' && c.toLowerCase().indexOf(filterClassLower) !== -1;
-        });
-        if (!match) return;
-      }
-      if (filterTextLower) {
-        if (!text || text.toLowerCase().indexOf(filterTextLower) === -1) return;
-      }
-      if (!includeEmpty && classes.length === 0 && type !== 'Section' && type !== 'Body') return;
-      out.push(entry);
-    }
-
-    helpers.walkTree(root, function(node, depth) {
-      totalWalked++;
-
-      // v1.6.0 — maintain parent stack for includeParent
-      while (parentStack.length > 0 && parentStack[parentStack.length - 1].depth >= depth) {
-        parentStack.pop();
-      }
-
-      var built = buildEntry(node, depth, sbs, entryOpts, parentIndex);
-
-      // hideTemplateRoots: skip nodes that are template roots at the natural depth 1
-      if (hideTemplateRoots && expandComponents && depth === 1 && built.symInfo && built.symInfo.root === true) {
-        // Still update parent stack for descendants
-        var skippedId = node.get && node.get('id');
-        if (skippedId) parentStack.push({ depth: depth, id: skippedId });
-        return;
-      }
-
-      // v1.6.0 — set parent_id from stack top if includeParent + not compact
-      if (includeParent && !compact && parentStack.length > 0) {
-        built.entry.parent_id = parentStack[parentStack.length - 1].id;
-      }
-
-      // v3.16.0 — breadcrumb computed BEFORE pushing self on stack (= just ancestors)
-      if (includeBreadcrumb && parentStack.length > 0) {
-        built.entry.breadcrumb = parentStack.map(function(p) {
-          return p.classFirst ? p.type + '.' + p.classFirst : (p.type || 'Node');
-        }).join(' > ');
-      }
-
-      // Push current node on stack BEFORE filters/expand (children of current node need its id as parent)
-      var currentId = node.get && node.get('id');
-      if (currentId) parentStack.push({
-        depth: depth,
-        id: currentId,
-        type: built.type,
-        classFirst: (built.classes && built.classes[0]) || null
-      });
-
-      applyFiltersAndPush(built.entry, built.type, built.classes, built.text);
-
-      // v3.3.0 — expandSlotOverrides : for Symbol instances, reveal nested instances stored in
-      // data.sym.overrides[slotPropId] (slot children that the standard `children` walker misses).
-      if (expandSlotOverrides && built.type === 'Symbol') {
-        slotOverridesCount += expandSlotOverridesAt(node, depth, out, { compact: compact });
-      }
-
-      // expandComponents: for Symbol instances, walk their template inline
-      if (expandComponents && built.type === 'Symbol' && built.symInfo && built.symInfo.inst) {
-        var template = templatesById[built.symInfo.inst];
-        if (template) {
-          var templateChildren = template.get('children');
-          if (templateChildren && templateChildren.forEach) {
-            templateChildren.forEach(function(childNode) {
-              // Recursive walk of template subtree, with depth offset = symbol.depth + 1
-              helpers.walkTree(childNode, function(tNode, tDepth) {
-                expandedCount++;
-                var tBuilt = buildEntry(tNode, depth + 1 + tDepth, sbs, entryOpts, parentIndex);
-                if (!compact) {
-                  tBuilt.entry.fromTemplate = built.symInfo.inst;
-                  if (built.symInfo.name) tBuilt.entry.fromComponent = built.symInfo.name;
-                }
-                applyFiltersAndPush(tBuilt.entry, tBuilt.type, tBuilt.classes, tBuilt.text);
-              }, { maxDepth: maxDepth });
+        var state = helpers.getReduxState();
+        var sbStore = state && state.StyleBlockStore;
+        if (sbStore && sbStore.get) {
+          var blocks = sbStore.get('styleBlocks'); blocks = blocks && blocks.toJS ? blocks.toJS() : blocks;
+          var pi = sbStore.get('parentIndex'); pi = pi && pi.toJS ? pi.toJS() : pi;
+          if (blocks && pi) {
+            nameParent = {};
+            Object.keys(pi).forEach(function(childId) {
+              var childBlock = blocks[childId];
+              var parentBlock = blocks[pi[childId]];
+              if (childBlock && childBlock.name) nameParent[childBlock.name] = (parentBlock && parentBlock.name) || true;
             });
           }
         }
-      }
-    }, { maxDepth: maxDepth });
+      } catch (e) { nameParent = null; }
+    }
 
-    var result = { ok: true, count: out.length, total_walked: totalWalked, source: 'redux', tree: out };
-    if (expandComponents) result.expanded = expandedCount;
-    if (expandSlotOverrides) result.slot_overrides = slotOverridesCount; // v3.3.0
+    var TEXT_BEARING = {
+      Heading: true, Paragraph: true, TextLink: true, Link: true, NavbarLink: true,
+      Button: true, Span: true, Blockquote: true, ListItem: true, FormBlockLabel: true
+    };
+
+    function wfType(el) {
+      var tag = el.tagName;
+      var rawCls = (el.className && el.className.baseVal != null) ? el.className.baseVal : (el.className || '');
+      var cls = ' ' + String(rawCls).toLowerCase() + ' ';
+      switch (tag) {
+        case 'H1': case 'H2': case 'H3': case 'H4': case 'H5': case 'H6': return 'Heading';
+        case 'P': return 'Paragraph';
+        case 'A':
+          if (cls.indexOf(' w-button ') !== -1 || cls.indexOf(' button ') !== -1) return 'Button';
+          if (cls.indexOf(' w-nav-link ') !== -1) return 'NavbarLink';
+          return 'Link';
+        case 'IMG': return 'Image';
+        case 'SECTION': return 'Section';
+        case 'NAV': return 'Navbar';
+        case 'FORM': return 'FormWrapper';
+        case 'INPUT': return 'FormTextInput';
+        case 'TEXTAREA': return 'FormTextarea';
+        case 'SELECT': return 'FormSelect';
+        case 'BUTTON': return 'Button';
+        case 'UL': case 'OL': return 'List';
+        case 'LI': return 'ListItem';
+        case 'SPAN': return 'Span';
+        case 'BLOCKQUOTE': return 'Blockquote';
+        case 'LABEL': return 'FormBlockLabel';
+        case 'BODY': return 'Body';
+        case 'IFRAME': return 'HtmlEmbed';
+        case 'STRONG': return 'Strong';
+        case 'EM': return 'Emphasis';
+      }
+      if (cls.indexOf(' w-dyn-list ') !== -1) return 'CollectionList';
+      if (cls.indexOf(' w-dyn-items ') !== -1) return 'CollectionListWrapper';
+      if (cls.indexOf(' w-dyn-item ') !== -1) return 'CollectionItem';
+      if (cls.indexOf(' w-richtext ') !== -1) return 'RichText';
+      if (cls.indexOf(' w-embed ') !== -1) return 'HtmlEmbed';
+      if (tag === 'DIV') return 'Block';
+      return tag.charAt(0) + tag.slice(1).toLowerCase();
+    }
+
+    function classesOf(el) {
+      var c = el.className;
+      if (c && c.baseVal != null) c = c.baseVal; // SVG elements
+      return String(c || '').split(/\s+/).filter(Boolean);
+    }
+
+    function componentInstanceOf(el) {
+      var raw = el.getAttribute('data-wf-id');
+      if (!raw) return null;
+      try {
+        var arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length > 1) return arr[arr.length - 1];
+      } catch (e) {}
+      return null;
+    }
+
+    var ATTR_KEYS = ['id', 'alt', 'src', 'href', 'width', 'height', 'loading'];
+    var out = [];
+    var totalWalked = 0;
+
+    // Build + filter one node. Returns {type, classes, emitted} so the walker can
+    // track ancestors even for filtered-out nodes (tree shape ≠ output set).
+    function pushEntry(el, depth, parentId, ancestors) {
+      var wid = el.getAttribute('data-w-id');
+      var type = wfType(el);
+      var classes = classesOf(el);
+      var text = null;
+      if (includeText && TEXT_BEARING[type]) {
+        var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t.length > 200) t = t.substring(0, 199) + '…';
+        if (t) text = t;
+      }
+
+      var entry;
+      if (compact) {
+        entry = { d: depth, type: type, classes: classes };
+        if (text) entry.text = text;
+      } else {
+        entry = { depth: depth, type: type, tag: el.tagName.toLowerCase(), id: wid, classes: classes };
+      }
+
+      if (resolveCombo) {
+        entry.classesResolved = classes.map(function(name, i) {
+          var r = { name: name };
+          if (nameParent && nameParent[name]) {
+            r.isCombo = true;
+            r.parentName = (nameParent[name] === true ? null : nameParent[name]);
+          } else {
+            r.isCombo = (i > 0);
+          }
+          return r;
+        });
+      }
+
+      if (!compact) {
+        if (text) entry.text = text;
+        if (includeAttr) {
+          var attr = {}, hasAttr = false;
+          for (var ai = 0; ai < ATTR_KEYS.length; ai++) {
+            var k = ATTR_KEYS[ai], v = el.getAttribute(k);
+            if (v == null || v === '') continue;
+            if ((k === 'width' || k === 'height') && v === 'auto') continue;
+            attr[k] = v; hasAttr = true;
+          }
+          if (hasAttr) entry.attr = attr;
+        }
+        if (includeXattr) {
+          var xattr = {}, hasX = false, atts = el.attributes;
+          for (var xi = 0; xi < atts.length; xi++) {
+            var an = atts[xi].name;
+            if (an.indexOf('aria-') === 0 || an === 'role' ||
+                (an.indexOf('data-') === 0 && an.indexOf('data-w-') !== 0 && an !== 'data-wf-id')) {
+              xattr[an] = atts[xi].value; hasX = true;
+            }
+          }
+          if (hasX) entry.xattr = xattr;
+        }
+        var compInst = componentInstanceOf(el);
+        if (compInst) entry.componentInstance = compInst;
+        if (includeParent && parentId) entry.parent_id = parentId;
+        if (includeBreadcrumb && ancestors.length) {
+          entry.breadcrumb = ancestors.map(function(a) {
+            return a.classFirst ? a.type + '.' + a.classFirst : a.type;
+          }).join(' > ');
+        }
+      }
+
+      // filters (control output inclusion only, not traversal)
+      var pass = true;
+      if (filterType && type !== filterType) pass = false;
+      else if (filterClassLower && !classes.some(function(c) { return c.toLowerCase().indexOf(filterClassLower) !== -1; })) pass = false;
+      else if (filterTextLower && (!text || text.toLowerCase().indexOf(filterTextLower) === -1)) pass = false;
+      else if (!includeEmpty && classes.length === 0 && type !== 'Section' && type !== 'Body') pass = false;
+      if (pass) out.push(entry);
+      return { type: type, classes: classes };
+    }
+
+    // DFS. Only elements with data-w-id are emitted (real Webflow nodes); wrapper
+    // elements without an id are traversed transparently (depth unchanged) so the
+    // emitted depth equals the Navigator depth.
+    function walk(el, depth, parentId, ancestors) {
+      if (!el || el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'NOSCRIPT') return;
+      if (depth > maxDepth) return;
+      var wid = el.getAttribute('data-w-id');
+      var childDepth = depth, childParent = parentId, childAncestors = ancestors;
+      if (wid) {
+        totalWalked++;
+        var info = pushEntry(el, depth, parentId, ancestors);
+        childDepth = depth + 1;
+        childParent = wid;
+        childAncestors = ancestors.concat([{ type: info.type, classFirst: (info.classes && info.classes[0]) || null }]);
+      }
+      var kids = el.children;
+      for (var i = 0; i < kids.length; i++) walk(kids[i], childDepth, childParent, childAncestors);
+    }
+
+    walk(rootEl, 0, null, []);
+
+    var result = { ok: true, count: out.length, total_walked: totalWalked, source: 'dom_canvas', tree: out };
     if (rootIdScope) result.scoped_to = rootIdScope;
 
-    // v3.22.0 — direct_children récap : array compact des enfants directs du root
-    // (depth === 1 vs rootIdScope OR vs Body root). Place en TÊTE du retour avec
-    // hidden_on_canvas flag (DOM iframe inspection : display:none inline OR
-    // w-condition-invisible class). Élimine le pattern récurrent de filtre
-    // côté caller `parent_id === rootId` + capture les nodes "hidden in builder"
-    // Designer (œil barré Navigator) noyés sinon dans le DFS du tree volumineux.
-    // Skip les virtual nodes (fromTemplate/fromSlotOverride). Backward compat 100%.
-    var directChildrenRedux = out.filter(function(e) {
-      return e.depth === 1 && !e.fromTemplate && !e.fromSlotOverride;
-    });
-    var canvasDocDC = null;
-    try {
-      var canvasIfDC = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
-      canvasDocDC = canvasIfDC && canvasIfDC.contentDocument;
-    } catch (eDC0) { canvasDocDC = null; }
-    result.direct_children = directChildrenRedux.map(function(e) {
-      var item = {
-        id: e.id,
-        type: e.type,
-        tag: e.tag || null,
-        classes: Array.isArray(e.classes) ? e.classes.join(' ') : ''
-      };
-      if (canvasDocDC) {
+    // direct_children: depth-1 nodes (children of root) + hidden_on_canvas flag.
+    var depthKey = compact ? 'd' : 'depth';
+    var win = doc.defaultView;
+    result.direct_children = out.filter(function(e) { return e[depthKey] === 1; }).map(function(e) {
+      var id = compact ? null : e.id;
+      var item = { id: id, type: e.type, tag: e.tag || null, classes: Array.isArray(e.classes) ? e.classes.join(' ') : '' };
+      if (id) {
         try {
-          var elDC = canvasDocDC.querySelector('[data-w-id="' + e.id + '"]');
-          if (elDC) {
-            var win = elDC.ownerDocument && elDC.ownerDocument.defaultView;
-            var cs = win ? win.getComputedStyle(elDC) : null;
-            var inlineHidden = (cs && cs.display === 'none');
-            var conditionInvisible = elDC.classList.contains('w-condition-invisible');
-            item.hidden_on_canvas = inlineHidden || conditionInvisible || false;
+          var elx = doc.querySelector('[data-w-id="' + id + '"]');
+          if (elx) {
+            var cs = win ? win.getComputedStyle(elx) : null;
+            item.hidden_on_canvas = (cs && cs.display === 'none') || elx.classList.contains('w-condition-invisible') || false;
           } else {
-            item.hidden_on_canvas = null; // not present in iframe DOM
+            item.hidden_on_canvas = null;
           }
-        } catch (eDC1) { item.hidden_on_canvas = null; }
+        } catch (e2) { item.hidden_on_canvas = null; }
       }
       return item;
     });
     result.direct_children_count = result.direct_children.length;
 
-    // v3.21.0 — DOM audit pour rootId scope. Détecte les enfants directs visibles
-    // dans le DOM iframe canvas mais absents du walk Redux. Cas confirmé empirique
-    // (s569 AVG cocktails/buffets/menus/etc.) : Symbol children avec prop
-    // `Visibility=false hasOverride=true` rendus `w-condition-invisible` côté staging
-    // n'apparaissent pas dans `parent.children` Immutable du AbstractNodeStore. Sans
-    // ce check, un dumpTree({rootId: row.id}) retourne 0/N enfants au lieu de N+1
-    // → décisions automatiques basées sur le scan ratent les doublons à supprimer.
-    // Best-effort : si l'iframe canvas n'est pas accessible (init bridge en cours),
-    // skip silencieusement — pas de fail. Coût ~2-3ms par call (1 querySelector + N
-    // attribute reads). Le warning est posé dans result.dom_audit, jamais en flat
-    // tree pour ne pas casser les consommateurs existants.
-    if (rootIdScope) {
-      try {
-        var canvas21 = document.getElementById('site-iframe-next') || document.getElementById('site-iframe');
-        var doc21 = canvas21 && canvas21.contentDocument;
-        if (doc21) {
-          var domRoot = doc21.querySelector('[data-w-id="' + rootIdScope + '"]');
-          if (domRoot) {
-            var domChildIds = [];
-            for (var i21 = 0; i21 < domRoot.children.length; i21++) {
-              var c21 = domRoot.children[i21];
-              var cid = c21.getAttribute('data-w-id');
-              if (cid) domChildIds.push(cid);
-            }
-            var reduxChildIds = {};
-            out.forEach(function(e) {
-              // depth 1 = direct child of rootIdScope (rootIdScope itself = depth 0)
-              // Skip fromTemplate/fromSlotOverride entries (virtual nodes injected
-              // par expandComponents/expandSlotOverrides → pas des enfants réels).
-              if (e.depth === 1 && e.id && !e.fromTemplate && !e.fromSlotOverride) {
-                reduxChildIds[e.id] = true;
-              }
-            });
-            var domOnly = domChildIds.filter(function(id) { return !reduxChildIds[id]; });
-            if (domOnly.length > 0) {
-              result.dom_audit = {
-                warning: 'Redux walk missed ' + domOnly.length + ' direct child(ren) visible in DOM canvas (likely Symbol with prop Visibility=false hasOverride=true → w-condition-invisible)',
-                dom_only_children: domOnly.map(function(id) {
-                  var el = doc21.querySelector('[data-w-id="' + id + '"]');
-                  return {
-                    id: id,
-                    tag: el ? el.tagName : null,
-                    classes: el ? (el.className || '').split(/\s+/).filter(Boolean) : [],
-                    text: el ? (el.textContent || '').trim().slice(0, 80) : null,
-                    invisible: el ? el.classList.contains('w-condition-invisible') : null
-                  };
-                })
-              };
-            }
-          }
-        }
-      } catch (e21) { /* swallow — DOM audit best-effort, no fail */ }
-    }
-
-    // v3.17.0 — DOM canvas fallback si Redux walk = 0 match + filter (Text|Class) actif
-    // Couvre les cas non-Redux : Symbol inner-text, CMS binding, content injecté par script.
-    // Skip si rootIdScope (l'utilisateur cible un subtree Redux spécifique).
-    var hasFallbackableFilter = !!(filterClassLower || filterTextLower);
-    if (out.length === 0 && hasFallbackableFilter && !rootIdScope) {
-      var fallback = walkDOMFallback({
-        filterText: args.filterText,
-        filterClass: args.filterClass
-      }, 10);
-      if (fallback.ok && fallback.count > 0) {
-        result.source = 'dom_canvas';
-        result.fallback_reason = 'redux_walk_no_match';
-        result.original_redux_count = 0;
-        result.count = fallback.count;
-        result.tree = fallback.tree;
-        result.dom_walk_duration_ms = fallback.duration_ms;
-        result.dom_walk_total = fallback.total_walked;
-        result.note = 'Match trouvé via DOM canvas walk (pas dans Redux store) — utiliser `ancestor_data_w_id` pour scrollToElement/select_element. Cas typique : Symbol inner-text, CMS binding, script-injected.';
-        return result;
-      }
-    }
-
-    // v1.6.0 — hint heuristics for count===0 (uniquement si fallback DOM aussi vide)
+    // hint for empty results.
     if (out.length === 0) {
-      var hint = null;
       var hasFilter = !!(filterClassLower || filterTextLower || filterType);
-      if (hasFilter && totalWalked < 50) {
-        hint = 'Tree shallow (' + totalWalked + ' nodes walked) — page may not be fully loaded · check Designer page tab + reload if needed';
-      } else if (filterClassLower && maxDepth < 12 && totalWalked < 200) {
-        hint = "No match for class '" + args.filterClass + "' at maxDepth=" + maxDepth + " (walked " + totalWalked + ') — Webflow cards typically at depth 8-10, try maxDepth>=12 or remove maxDepth (default 50)';
-      } else if (filterClassLower) {
-        hint = "No match for class '" + args.filterClass + "' (case-insensitive substring · walked " + totalWalked + ' Redux nodes + DOM fallback aussi vide) — check spelling';
-      } else if (filterTextLower) {
-        hint = "No match for text '" + args.filterText + "' — text checked on Redux text-bearing types AND DOM canvas fallback (1543 nodes typique). Element probably absent from page or filterText too specific.";
-      } else if (filterType) {
-        hint = "No node of type '" + args.filterType + "' (walked " + totalWalked + ')';
+      if (hasFilter) {
+        result.hint = 'No match (DOM canvas walk · ' + totalWalked + ' nodes) — check spelling/type, '
+          + 'or the element may be CMS-empty / hidden / outside the scoped root.';
+      } else if (totalWalked < 5) {
+        result.hint = 'Canvas nearly empty (' + totalWalked + ' nodes) — Designer may still be loading · bring the Designer tab to front + retry.';
       }
-      if (hint) result.hint = hint;
     }
 
     return result;
