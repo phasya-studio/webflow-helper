@@ -1,4 +1,4 @@
-/* Webflow Helper v3.31.0 - 2026-06-02 */
+/* Webflow Helper v3.32.0 - 2026-06-02 */
 
 /**
  * Webflow Helper — minimal surface, exposes 28 cmds via `__webflowHelper.run()`
@@ -55,7 +55,7 @@
 (function() {
   'use strict';
 
-  var VERSION = '3.32.0';
+  var VERSION = '3.33.0';
   // Per-version empirical fix notes (addClassViaUI, style-selector UI cmds,
   // CodeMirror integration, etc.) extracted to
   // `tools/webflow-helper-CHANGELOG.md`. The code below is current behaviour.
@@ -5310,6 +5310,113 @@
   console.log('[PageCode] 2 commands registered: getPageCode, setPageCode (v3.30.0 s591 · Collection Pages support)');
 })();
 
+/**
+ * convertElement — convert an element's TYPE in place via Webflow's native
+ * "Convert to" action (ELEMENT_CONVERTED), preserving children + classes + styles.
+ *
+ * Reverse-engineered (QG s627) by intercepting `_webflow.dispatch` while a human
+ * triggered "Convert to → Link Block" from the canvas menu. The menu emits:
+ *   { type:'ELEMENT_CONVERTED', payload:{ nativeIdPath:[id], preset:<elementPreset> } }
+ * The `preset` is the REAL native registry object — NOT fabricated — read live from
+ *   window._webflow.state.DesignerStore.plugins.elementPresets._data.Basic[<key>]
+ * so this command is fully self-contained (no captured reference needed, survives reload).
+ *
+ * Why: premium templates often ship CTAs as Div Blocks wired to a modal interaction
+ * instead of real links. Converting Div→Link keeps the inner structure (text mask,
+ * icon embed, bg) and lets you then set the destination via setLinkSettings (app) —
+ * far more faithful & cheaper than recreating the button from scratch.
+ *
+ * Safety: the dispatched action is byte-for-byte what the menu sends (native preset),
+ * verified structurally identical to a manual conversion (QG s627). This is the ONE
+ * mutating dispatch deemed safe vs the s549 crash (which used FABRICATED EXPRESSION_ACTION
+ * payloads). The nested-link guard reproduces Webflow's own rule: an <a> cannot be nested
+ * in an <a> (the menu greys the option; a raw dispatch must reproduce that check).
+ *
+ * args: { nodeId, to?='LinkBlock', componentInstanceId?, waitMs?:{afterConvert} }
+ *   to = a key of elementPresets._data.Basic — e.g. 'LinkBlock','DivBlock','TextBlock',
+ *        'Button','Heading','Paragraph','TextLink'. Default 'LinkBlock'.
+ *   Note: page-scoped dumpTree is used for the before/after check, so the element must be
+ *         on the CURRENT page (switchPage first) and not buried in an unexpanded component.
+ * returns: { ok, nodeId, to, beforeTag, afterTag, expectedTag, classes, durationMs, error?, message? }
+ */
+(function() {
+  if (!window.__webflowHelper || !window.__webflowHelper._localCmd) {
+    console.warn('[convert] __webflowHelper not initialized — module skipped');
+    return;
+  }
+  var p = window.__webflowHelper;
+  function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  p._localCmd.convertElement = async function(args) {
+    args = args || {};
+    var nodeId = args.nodeId;
+    var to = args.to || 'LinkBlock';
+    var componentInstanceId = args.componentInstanceId || null;
+    var waitMs = (args.waitMs && args.waitMs.afterConvert) || 1400;
+    if (!nodeId) return { ok: false, error: 'nodeId required' };
+
+    var wf = window._webflow;
+    if (!wf || !wf.dispatch) return { ok: false, error: 'Webflow store/dispatch not accessible' };
+
+    // 1. Resolve the preset from the LIVE registry (never fabricate — that is what
+    //    crashed a page in s549). Path validated empirically QG s627.
+    var basic;
+    try { basic = wf.state.DesignerStore.plugins.elementPresets._data.Basic; }
+    catch (e) { return { ok: false, error: 'PRESET_REGISTRY_UNREACHABLE', message: 'elementPresets registry not reachable (Webflow internals moved?): ' + e.message }; }
+    var preset = basic && basic[to];
+    if (!preset || !preset.factory) {
+      return { ok: false, error: 'PRESET_NOT_FOUND', message: 'preset "' + to + '" not found. Available: ' + (basic ? Object.keys(basic).join(', ') : '(none)') };
+    }
+    var targetType = preset.factory && preset.factory.val && preset.factory.val.type; // e.g. ['Basic','Link']
+    var isLinkTarget = !!(targetType && targetType[1] === 'Link');
+    var expectedTag = (preset.helpData && preset.helpData.tag) || (isLinkTarget ? 'a' : 'div');
+
+    // 2. Read the tree: capture before-state + run the nested-link guard.
+    var tree;
+    try { tree = await p._localCmd.dumpTree({}); }
+    catch (e) { return { ok: false, error: 'DUMPTREE_FAILED', message: 'dumpTree (pre) failed: ' + e.message }; }
+    var nodes = (tree && tree.tree) || [];
+    var node = nodes.find(function(n) { return n.id === nodeId; });
+    if (!node) return { ok: false, error: 'NODE_NOT_FOUND', message: 'node ' + nodeId + ' not in current page tree (wrong page? switchPage first, or it is inside an unexpanded component)' };
+    var beforeTag = node.tag;
+
+    if (isLinkTarget) {
+      var cur = node;
+      while (cur && cur.parent_id) {
+        var par = nodes.find(function(n) { return n.id === cur.parent_id; });
+        if (!par) break;
+        if (par.tag === 'a') {
+          return { ok: false, error: 'NESTED_LINK_FORBIDDEN', message: 'Cannot convert to Link: ancestor ' + par.id + ' (' + (par.classes || []).join('.') + ') is already a Link (<a>). Webflow forbids nested links — take the element out of the parent link first.' };
+        }
+        cur = par;
+      }
+    }
+
+    // 3. Dispatch the native convert action (identical to the "Convert to" menu click).
+    var startT = Date.now();
+    var path = componentInstanceId ? [componentInstanceId, nodeId] : [nodeId];
+    wf.dispatch({ type: 'ELEMENT_CONVERTED', payload: { nativeIdPath: path, preset: preset } });
+    await wait(waitMs);
+
+    // 4. Verify the tag actually changed to the expected one.
+    var tree2;
+    try { tree2 = await p._localCmd.dumpTree({}); }
+    catch (e) { return { ok: false, error: 'DUMPTREE_FAILED', message: 'dumpTree (post) failed: ' + e.message }; }
+    var after = ((tree2 && tree2.tree) || []).find(function(n) { return n.id === nodeId; });
+    var afterTag = after ? after.tag : null;
+    var ok = afterTag === expectedTag;
+    return {
+      ok: ok, nodeId: nodeId, to: to, beforeTag: beforeTag, afterTag: afterTag,
+      expectedTag: expectedTag, classes: after ? after.classes : null,
+      durationMs: Date.now() - startT,
+      error: ok ? undefined : (afterTag === beforeTag ? 'CONVERT_NO_EFFECT' : 'CONVERT_UNEXPECTED_TAG'),
+      message: ok ? undefined : ('expected <' + expectedTag + '> got <' + afterTag + '>')
+    };
+  };
+
+  console.log('[convert] 1 command registered: convertElement (v3.33.0 s627 · Div↔Link via native ELEMENT_CONVERTED)');
+})();
+
 (function filterExposedCmds() {
   if (!window.__webflowHelper) {
     console.warn('[helper filter] __webflowHelper not initialized - skip filter');
@@ -5344,7 +5451,8 @@
     'openComponentView',
     'closeComponentView',
     'getPageCode',
-    'setPageCode'
+    'setPageCode',
+    'convertElement'
   ];
 
   // Wrap original run() - reject explicitly if cmd is not in whitelist
